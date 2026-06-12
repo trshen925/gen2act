@@ -1,0 +1,11 @@
+[project]
+name = "r2r-gen2act"
+version = "0.1.0"
+description = "Robot-to-robot Gen2Act refactor for Franka/Open-X datasets"
+requires-python = ">=3.11"
+
+dependencies = ["torch", "torchvision", "numpy", "imageio"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["r2r_gen2act*"]

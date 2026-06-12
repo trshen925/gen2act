@@ -1,0 +1,45 @@
+experiment:
+  name: franka_hdf5_dinov2
+  output_dir: /mnt/afs/shentingrui/code/dreamwheel/franka_dataset/robot2robot_gen2act/outputs/franka_hdf5_dinov2
+
+data:
+  dataset_type: hdf5_franka
+  hdf5_path: /mnt/afs/shentingrui/code/dreamwheel/franka_dataset/pick_n_place_258.hdf5
+  action_stats_path: /mnt/afs/shentingrui/code/dreamwheel/franka_dataset/action_stats.json
+  source_camera: table_cam
+  target_camera: wrist_cam
+  action_key: actions
+  source_sampling: linspace
+  source_len: 16
+  target_history_len: 8
+  target_offset: 0
+  image_size: 224
+  action_stride: 1
+  terminate_positive_window: 5
+
+action:
+  dim: 7
+  pose_dims: 6
+  num_bins: 256
+  bounds_source: stats_json
+  stats_path: /mnt/afs/shentingrui/code/dreamwheel/franka_dataset/action_stats.json
+
+model:
+  backbone:
+    name: dinov2_vitb14
+    pretrained: true
+    freeze: false
+    local_checkpoint: ""
+    allow_random_init: false
+  image_size: 224
+  source_len: 16
+  target_history_len: 8
+  latent_tokens: 64
+  hidden_dim: 768
+  resampler_layers: 2
+  resampler_heads: 8
+  fusion_heads: 8
+  num_bins: 256
+  pose_action_dims: 6
+  point_tracking:
+    enabled: false

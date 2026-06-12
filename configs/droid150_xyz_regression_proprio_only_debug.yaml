@@ -1,0 +1,90 @@
+experiment:
+  name: droid150_xyz_regression_proprio_only_debug
+  output_dir: /mnt/afs/shentingrui/code/dreamwheel/franka_dataset/robot2robot_gen2act/outputs/droid150_xyz_regression_proprio_only_debug
+
+data:
+  dataset_type: openx_droid
+  root: /mnt/afs/shentingrui/data/droid-150
+  episode_glob: "[0-9][0-9][0-9][0-9]"
+  source_video_name: first_last_i2v.mp4
+  target_video_name: gt.mp4
+  metadata_name: data.json
+  source_sampling: linspace
+  source_len: 8
+  target_history_len: 4
+  target_offset: 0
+  image_size: 224
+  action_stride: 10
+  terminate_positive_window: 5
+  val_ratio: 0.2
+  split_seed: 42
+  max_episodes: 40
+  max_windows: 1200
+  load_videos: false
+  proprioception:
+    enabled: true
+    source: observations
+    key: cartesian_position
+    step: target
+    dims: 6
+
+action:
+  dim: 7
+  pose_dims: 3
+  mode: regression
+  num_bins: 64
+  bounds_source: config
+  bounds_low: [0.247230663895607, -0.568376362323761, -0.16521209478378296]
+  bounds_high: [0.8506479263305664, 0.5075082778930664, 0.8757533431053162]
+  mapping:
+    type: droid_action_dict_cartesian_position
+
+model:
+  type: proprioception_only
+  backbone:
+    name: dinov2_vitb14
+    pretrained: true
+    freeze: true
+    local_checkpoint: ""
+    allow_random_init: false
+  image_size: 224
+  source_len: 8
+  target_history_len: 4
+  latent_tokens: 8
+  hidden_dim: 256
+  resampler_layers: 1
+  resampler_heads: 8
+  fusion_heads: 8
+  num_bins: 64
+  pose_action_dims: 3
+  proprioception_dim: 6
+  mlp_layers: 3
+  point_tracking:
+    enabled: false
+
+train:
+  seed: 42
+  batch_size: 2
+  epochs: 5
+  num_workers: 2
+  amp: true
+  grad_clip_norm: 1.0
+  shuffle: true
+  optimizer:
+    name: adamw
+    lr: 0.001
+    backbone_lr_multiplier: 0.0
+    weight_decay: 0.05
+    betas: [0.9, 0.95]
+  losses:
+    action_weight: 1.0
+    gripper_weight: 0.0
+    terminate_weight: 0.0
+    action_regression_loss: smooth_l1
+    smooth_l1_beta: 0.02
+  logging:
+    log_every: 50
+  debug:
+    anomaly_detection: false
+    debug_isfinite: false
+    debug_norms: false

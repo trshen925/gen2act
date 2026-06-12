@@ -1,0 +1,43 @@
+experiment:
+  name: openx_droid100_gen_dinov2
+  output_dir: /mnt/afs/shentingrui/code/dreamwheel/franka_dataset/robot2robot_gen2act/outputs/openx_droid100_gen_dinov2
+
+data:
+  dataset_type: openx_droid
+  root: /mnt/afs/shentingrui/code/dreamwheel/franka_dataset/open-x/droid_100-gen
+  source_video_name: generated.mp4
+  target_video_name: groundtruth.mp4
+  metadata_name: data.json
+  source_len: 16
+  target_history_len: 8
+  image_size: 224
+  action_stride: 1
+  terminate_positive_window: 5
+
+action:
+  dim: 7
+  pose_dims: 6
+  num_bins: 256
+  bounds_source: config
+  bounds_low: [-1.0, -1.0, -1.0, -3.2, -1.0, -1.0]
+  bounds_high: [1.0, 1.0, 1.0, 3.2, 1.0, 1.0]
+  mapping:
+    type: droid_actions_first6_plus_gripper
+
+model:
+  backbone:
+    name: dinov2_vitb14
+    pretrained: true
+    freeze: false
+    local_checkpoint: ""
+    allow_random_init: false
+  image_size: 224
+  source_len: 16
+  target_history_len: 8
+  latent_tokens: 64
+  hidden_dim: 768
+  resampler_layers: 2
+  resampler_heads: 8
+  fusion_heads: 8
+  num_bins: 256
+  pose_action_dims: 6

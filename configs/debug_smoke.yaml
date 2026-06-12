@@ -1,0 +1,74 @@
+experiment:
+  name: debug_smoke
+  output_dir: /mnt/afs/shentingrui/code/dreamwheel/franka_dataset/robot2robot_gen2act/outputs/debug_smoke
+
+data:
+  dataset_type: openx_droid
+  root: /mnt/afs/shentingrui/code/dreamwheel/franka_dataset/open-x/droid_100-gen
+  source_video_name: generated.mp4
+  target_video_name: groundtruth.mp4
+  metadata_name: data.json
+  source_len: 2
+  target_history_len: 2
+  target_offset: 0
+  image_size: 224
+  action_stride: 20
+  max_episodes: 2
+  max_windows: 4
+  terminate_positive_window: 5
+  val_ratio: 0.5
+  split_seed: 42
+
+action:
+  dim: 7
+  pose_dims: 6
+  num_bins: 16
+  bounds_source: config
+  bounds_low: [-1.0, -1.0, -1.0, -3.2, -1.0, -1.0]
+  bounds_high: [1.0, 1.0, 1.0, 3.2, 1.0, 1.0]
+  mapping:
+    type: droid_actions_first6_plus_gripper
+
+model:
+  backbone:
+    name: debug_small
+    pretrained: false
+    freeze: false
+    allow_random_init: true
+  image_size: 224
+  source_len: 2
+  target_history_len: 2
+  latent_tokens: 4
+  hidden_dim: 64
+  resampler_layers: 1
+  resampler_heads: 4
+  fusion_heads: 4
+  num_bins: 16
+  pose_action_dims: 6
+  point_tracking:
+    enabled: false
+
+train:
+  seed: 42
+  batch_size: 1
+  epochs: 1
+  num_workers: 0
+  amp: false
+  grad_clip_norm: 1.0
+  shuffle: true
+  optimizer:
+    name: adamw
+    lr: 0.0001
+    backbone_lr_multiplier: 0.1
+    weight_decay: 0.01
+    betas: [0.9, 0.95]
+  losses:
+    action_weight: 1.0
+    gripper_weight: 0.2
+    terminate_weight: 0.1
+  logging:
+    log_every: 1
+  debug:
+    anomaly_detection: false
+    debug_isfinite: false
+    debug_norms: false

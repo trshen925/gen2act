@@ -1,0 +1,72 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import torch
+
+from r2r_gen2act.data.factories import build_action_codec, build_dataset
+from r2r_gen2act.modeling.factory import build_policy
+from r2r_gen2act.training.checkpoint import load_checkpoint
+
+
+class PolicyPredictor:
+    def __init__(self, cfg: dict, checkpoint_path: str | Path, device: str | None = None, strict: bool = True) -> None:
+        self.cfg = cfg
+        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.codec = build_action_codec(cfg)
+        self.model = build_policy(cfg).to(self.device)
+        self.checkpoint = load_checkpoint(checkpoint_path, self.model, self.device, strict=strict)
+        self.model.eval()
+
+    @torch.no_grad()
+    def predict_batch(self, batch: dict) -> dict:
+        source = batch["source_video"].to(self.device)
+        target = batch["target_history"].to(self.device)
+        if source.dim() == 4:
+            source = source.unsqueeze(0)
+            target = target.unsqueeze(0)
+        proprioception = batch.get("proprioception")
+        if torch.is_tensor(proprioception):
+            proprioception = proprioception.to(self.device)
+            if proprioception.dim() == 1:
+                proprioception = proprioception.unsqueeze(0)
+        outputs = self.model(source, target, proprioception)
+        if "action_pred" in outputs:
+            pose = outputs["action_pred"].cpu()
+            bins = None
+        else:
+            bins = outputs["action_logits"].argmax(dim=-1)
+            pose = self.codec.decode(bins).cpu()
+        gripper_prob = outputs["gripper_logits"].softmax(dim=-1).cpu()
+        terminate_prob = outputs["terminate_logits"].softmax(dim=-1).cpu()
+        result = {"pose_action": pose, "gripper_prob": gripper_prob, "terminate_prob": terminate_prob}
+        if bins is not None:
+            result["action_bins"] = bins.cpu()
+        return result
+
+
+def predict_dataset_window(cfg: dict, checkpoint_path: str | Path, split: str, episode_id: str | None, start_index: int, save_path: str | Path | None = None, device: str | None = None, strict: bool = True) -> dict:
+    dataset = build_dataset(cfg, split)
+    if episode_id:
+        sample = dataset.sample_window(episode_id, start_index)
+    else:
+        sample = dataset[0]
+    predictor = PolicyPredictor(cfg, checkpoint_path, device=device, strict=strict)
+    pred = predictor.predict_batch(sample)
+    result = {
+        "episode_id": sample["episode_id"],
+        "start_index": int(sample["start_index"]),
+        "target_step": int(sample["target_step"]),
+        "pose_action": pred["pose_action"][0].tolist(),
+        "gripper_prob": pred["gripper_prob"][0].tolist(),
+        "terminate_prob": pred["terminate_prob"][0].tolist(),
+        "checkpoint": str(checkpoint_path),
+    }
+    if "action_bins" in pred:
+        result["action_bins"] = pred["action_bins"][0].tolist()
+    if save_path:
+        path = Path(save_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    return result
