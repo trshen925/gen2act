@@ -1,0 +1,142 @@
+# Step 7 — fused multi-condition model with the reliable cross-attention regression architecture
+# (Exp 15 winner: query-in-backbone readout + self-attn mix + cross-attn regression + deep supervision).
+# Conditions: source/reference video (linspace 8 frames of the demo) + current frame + tracked EE points
+# + current EE image position & depth. NO VideoMAEv2, NO flow head. Future info enters ONLY via the
+# source video (no extra future-frame inputs). Image latent widened: 32 readout queries/frame (was 16),
+# point latent summarized to 32 tokens for alignment.
+
+experiment:
+  name: droidex2000_step7_fused_queryreg
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidex2000_step7_fused_queryreg
+
+data:
+  dataset_type: openx_droid
+  root: /mnt/pfs/share/shentingrui/dataset/droid-ex/droid_2000_with_extrinsics_filtered
+  episode_glob: "[0-9][0-9][0-9][0-9]"
+  source_video_name: gt.mp4
+  target_video_name: gt.mp4
+  metadata_name: data.json
+  frames_subdir: frames
+  source_sampling: linspace          # reference demo = whole gt.mp4, 8 frames (carries task/future intent)
+  source_len: 8
+  target_history_len: 1              # current frame only (= target_step); no extra future frames
+  target_offset: 0
+  future_horizon: 5
+  image_size: 224
+  action_stride: 10
+  terminate_positive_window: 5
+  val_ratio: 0.2
+  val_count: 100
+  split_seed: 42
+  gripper_threshold: 0.5
+  source_jitter: {enabled: false, max_offset: 0}
+  window_jitter: {enabled: true, max_offset: 3}
+  augmentation:
+    enabled: true
+    p: 1.0
+    brightness: 0.1
+    contrast: 0.1
+    saturation: 0.05
+    noise_std: 0.01
+  proprioception:
+    enabled: true
+    source: camera_projection
+    key: cartesian_position
+    step: target
+    dims: 3                          # (u_norm, v_norm, camera-depth z)
+    projection_max_abs: 3.0
+    projection_max_outside_frac: 0.05
+  point_tracking:
+    enabled: true
+    num_points: 10
+    num_time: 60
+
+action:
+  dim: 10
+  pose_dims: 9
+  mode: regression
+  regression_normalize: true
+  chunk_size: 4
+  num_bins: 64
+  bounds_source: config
+  bounds_low: [-0.30, -0.30, -0.30, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]
+  bounds_high: [0.30, 0.30, 0.30, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  mapping:
+    type: droid_observation_cartesian_future_delta_pose6d_camera
+    camera_extrinsics_key: ""
+    extrinsics_convention: camera_pose_in_base
+
+model:
+  type: fused_query_reg
+  backbone:
+    name: dinov2_vitb14
+    pretrained: true
+    freeze: false
+    unfreeze_last_n_blocks: 0
+    local_checkpoint: ""
+    allow_random_init: false
+  image_size: 224
+  source_len: 8
+  target_history_len: 1
+  latent_tokens: 128
+  hidden_dim: 768
+  num_queries: 4              # = chunk_size (schema); decoder action queries
+  num_bins: 64
+  pose_action_dims: 9
+  proprioception_dim: 3
+  query_readout:
+    num_queries: 32           # image latent width (was 16) -> 32 tokens/frame
+    segmenter_start: 9
+  point_tracking:
+    num_points: 10
+    num_time: 60
+    hidden_dim: 384
+    heads: 6
+    attn_layers: 2
+  fused:
+    mixer_layers: 4           # self-attention over all condition tokens
+    mixer_heads: 8
+    point_tokens: 32          # point latent summarized to 32 tokens (aligned with image)
+    ee_tokens: 8
+    dropout: 0.1
+  cross_attn_reg:
+    hidden_dim: 768
+    num_layers: 6
+    heads: 8
+    dropout: 0.1
+    deep_supervision: true
+
+train:
+  seed: 42
+  batch_size: 24
+  epochs: 20
+  num_workers: 24
+  amp: true
+  amp_dtype: bfloat16
+  grad_clip_norm: 1.0
+  shuffle: true
+  optimizer:
+    name: adamw
+    lr: 0.0003
+    backbone_lr_multiplier: 0.3
+    llrd: 0.7
+    weight_decay: 0.05
+    betas: [0.9, 0.95]
+  scheduler:
+    name: cosine
+    warmup_ratio: 0.05
+    min_lr_ratio: 0.05
+  losses:
+    action_weight: 1.0
+    gripper_weight: 0.2
+    terminate_weight: 0.0
+    action_regression_loss: smooth_l1
+    smooth_l1_beta: 0.1
+    deep_supervision_weight: 1.0
+  logging:
+    log_every: 50
+  eval_every_epochs: 2
+  debug:
+    anomaly_detection: false
+    debug_isfinite: false
+    debug_norms: false

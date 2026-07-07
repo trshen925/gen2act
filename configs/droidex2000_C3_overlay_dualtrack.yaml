@@ -1,0 +1,152 @@
+# C3 — C1 (dual-track causal) + HAMSTER-style trajectory OVERLAY on the current frame.
+# Diagnosis motivating this: the global demo track (fed as abstract tokens) is nearly ignored
+# (stream-importance +0.03), so the model localizes/predicts via MOMENTUM, not by reading the demo.
+# Fix (HAMSTER): render the whole-episode demo EE 2D path onto the current frame so the SAME DINOv2
+# backbone grounds it to the scene — the model can visually find "where am I on the path" and read the
+# future direction from the demo (esp. at phase transitions where momentum fails). + path-coord noise
+# aug (robust to imperfect/generated paths). Everything else = C1 (global+causal point tracks kept,
+# so stream-importance can attribute how much the OVERLAY adds on top).
+
+experiment:
+  name: droidex2000_C3_overlay_dualtrack
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidex2000_C3_overlay_dualtrack
+
+data:
+  dataset_type: openx_droid
+  root: /mnt/pfs/share/shentingrui/dataset/droid-ex/droid_2000_with_extrinsics_filtered
+  episode_glob: "[0-9][0-9][0-9][0-9]"
+  source_video_name: gt.mp4
+  target_video_name: gt.mp4
+  metadata_name: data.json
+  frames_subdir: frames
+  source_sampling: linspace
+  source_len: 8
+  target_history_len: 1
+  target_offset: 0
+  future_horizon: 5
+  image_size: 224
+  action_stride: 10
+  terminate_positive_window: 5
+  val_ratio: 0.2
+  val_count: 100
+  split_seed: 42
+  gripper_threshold: 0.5
+  source_jitter: {enabled: false, max_offset: 0}
+  window_jitter: {enabled: true, max_offset: 3}
+  augmentation:
+    enabled: true
+    p: 1.0
+    brightness: 0.1
+    contrast: 0.1
+    saturation: 0.05
+    noise_std: 0.01
+  proprioception:
+    enabled: true
+    source: camera_projection
+    key: cartesian_position
+    step: target
+    dims: 3
+    append_progress: true
+    projection_max_abs: 3.0
+    projection_max_outside_frac: 0.05
+  point_tracking:
+    enabled: true
+    num_points: 10
+    num_time: 32
+    sequence: true
+    causal_window: [-24, 0]
+    causal_num_time: 16
+  trajectory_overlay:
+    enabled: true                                 # draw whole-episode demo EE path onto current frame
+    radius: 1.6
+    coord_noise_std: 2.5                           # px noise on path coords (train) = HAMSTER path-noise aug
+    mark_current: false                            # green dot @ target_step (alignment viz only)
+
+action:
+  dim: 10
+  pose_dims: 9
+  mode: regression
+  regression_normalize: true
+  chunk_size: 4
+  num_bins: 64
+  bounds_source: config
+  bounds_low: [-0.30, -0.30, -0.30, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]
+  bounds_high: [0.30, 0.30, 0.30, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  mapping:
+    type: droid_observation_cartesian_future_delta_pose6d_camera
+    camera_extrinsics_key: ""
+    extrinsics_convention: camera_pose_in_base
+
+model:
+  type: fused_query_reg
+  backbone:
+    name: dinov2_vitb14
+    pretrained: true
+    freeze: false
+    unfreeze_last_n_blocks: 0
+    local_checkpoint: ""
+    allow_random_init: false
+  image_size: 224
+  source_len: 8
+  target_history_len: 1
+  latent_tokens: 128
+  hidden_dim: 768
+  num_queries: 4
+  num_bins: 64
+  pose_action_dims: 9
+  proprioception_dim: 4
+  query_readout:
+    num_queries: 32
+    segmenter_start: 9
+  point_tracking:
+    num_points: 10
+    num_time: 32
+    hidden_dim: 384
+    sequence: true
+  fused:
+    mixer_layers: 4
+    mixer_heads: 8
+    point_tokens: 32
+    ee_tokens: 8
+    dropout: 0.1
+  cross_attn_reg:
+    hidden_dim: 768
+    num_layers: 6
+    heads: 8
+    dropout: 0.1
+    deep_supervision: true
+
+train:
+  seed: 42
+  batch_size: 24
+  epochs: 20
+  num_workers: 24
+  amp: true
+  amp_dtype: bfloat16
+  grad_clip_norm: 1.0
+  shuffle: true
+  optimizer:
+    name: adamw
+    lr: 0.00012
+    backbone_lr_multiplier: 0.3
+    llrd: 0.7
+    weight_decay: 0.05
+    betas: [0.9, 0.95]
+  scheduler:
+    name: cosine
+    warmup_ratio: 0.10
+    min_lr_ratio: 0.05
+  losses:
+    action_weight: 1.0
+    gripper_weight: 0.2
+    terminate_weight: 0.0
+    action_regression_loss: smooth_l1
+    smooth_l1_beta: 0.1
+    deep_supervision_weight: 1.0
+  logging:
+    log_every: 50
+  eval_every_epochs: 2
+  debug:
+    anomaly_detection: false
+    debug_isfinite: false
+    debug_norms: false

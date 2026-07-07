@@ -1,0 +1,144 @@
+# C15v2 — C15 续训，aux_traj_weight 从 0.5 降至 0.1。
+#
+# C15 结论：weight=0.5 与 action loss 争梯度，反而比 C13 差 10%。
+# 本次：从 C15 ep20 latest.pt 接续，再跑 20 epoch（ep21-40），
+# 降 aux_traj_weight=0.1，让 action loss 获得更多梯度。
+# 总 epoch 设为 40（trainer 快进调度器到 ep20 处，继续 cosine decay 的后半段）。
+
+experiment:
+  name: droidex2000_C15v2_delta_auxtraj_w01
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidex2000_C15v2_delta_auxtraj_w01
+
+data:
+  dataset_type: openx_droid
+  root: /mnt/pfs/share/shentingrui/dataset/droid-ex/droid_2000_with_extrinsics_filtered
+  episode_glob: "[0-9][0-9][0-9][0-9]"
+  source_video_name: gt.mp4
+  target_video_name: gt.mp4
+  metadata_name: data.json
+  frames_subdir: frames
+  source_sampling: linspace
+  source_len: 8
+  target_history_len: 1
+  target_offset: 0
+  future_horizon: 5
+  image_size: 224
+  action_stride: 10
+  terminate_positive_window: 5
+  val_ratio: 0.2
+  val_count: 100
+  split_seed: 42
+  gripper_threshold: 0.5
+  window_jitter: {enabled: true, max_offset: 3}
+  augmentation:
+    enabled: true
+    p: 1.0
+    brightness: 0.1
+    contrast: 0.1
+    saturation: 0.05
+    noise_std: 0.01
+  proprioception:
+    enabled: true
+    source: camera_projection
+    key: cartesian_position
+    step: target
+    dims: 3
+    append_progress: false
+    projection_max_abs: 3.0
+    projection_max_outside_frac: 0.05
+  future_traj:
+    enabled: false
+  aux_traj:
+    enabled: true
+
+action:
+  dim: 10
+  pose_dims: 9
+  mode: regression
+  regression_normalize: true
+  chunk_size: 8
+  num_bins: 64
+  bounds_source: config
+  bounds_low:  [-0.30, -0.30, -0.30, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]
+  bounds_high: [ 0.30,  0.30,  0.30,  1.0,  1.0,  1.0,  1.0,  1.0,  1.0]
+  mapping:
+    type: droid_observation_cartesian_future_delta_pose6d_camera
+    camera_extrinsics_key: ""
+    extrinsics_convention: camera_pose_in_base
+
+model:
+  type: fused_query_reg
+  use_source_video: true
+  current_full_patch: true
+  joint_action: true
+  backbone:
+    name: dinov2_vitb14
+    pretrained: true
+    freeze: false
+    unfreeze_last_n_blocks: 0
+    local_checkpoint: ""
+    allow_random_init: false
+  image_size: 224
+  source_len: 8
+  target_history_len: 1
+  latent_tokens: 128
+  hidden_dim: 768
+  num_queries: 8
+  num_bins: 64
+  pose_action_dims: 9
+  proprioception_dim: 3
+  query_readout:
+    num_queries: 32
+    segmenter_start: 9
+  point_tracking:
+    use_global: false
+    sequence: false
+  fused:
+    mixer_layers: 4
+    mixer_heads: 8
+    point_tokens: 32
+    ee_tokens: 8
+    dropout: 0.1
+  depth:
+    enabled: false
+  aux_traj:
+    enabled: true
+
+train:
+  seed: 42
+  resume_full_checkpoint: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidex2000_C15_delta_auxtraj/latest.pt
+  batch_size: 12
+  epochs: 30          # ep21-30（从 ep20 checkpoint 接续，再跑 10 epoch）
+  num_workers: 16
+  amp: true
+  amp_dtype: bfloat16
+  grad_clip_norm: 1.0
+  shuffle: true
+  optimizer:
+    name: adamw
+    lr: 0.00012
+    backbone_lr_multiplier: 0.3
+    llrd: 0.7
+    weight_decay: 0.05
+    betas: [0.9, 0.95]
+  scheduler:
+    name: cosine
+    warmup_ratio: 0.10
+    min_lr_ratio: 0.05
+  losses:
+    action_weight: 1.0
+    gripper_weight: 0.2
+    terminate_weight: 0.0
+    action_regression_loss: smooth_l1
+    smooth_l1_beta: 0.1
+    deep_supervision_weight: 1.0
+    aux_traj_weight: 0.1
+    aux_traj_bounds_low:  [-0.60, -0.60, 0.20, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]
+    aux_traj_bounds_high: [ 0.60,  0.60, 1.20,  1.0,  1.0,  1.0,  1.0,  1.0,  1.0]
+  logging:
+    log_every: 50
+  eval_every_epochs: 2
+  debug:
+    anomaly_detection: false
+    debug_isfinite: false
+    debug_norms: false

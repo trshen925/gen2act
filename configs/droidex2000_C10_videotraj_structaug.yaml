@@ -1,0 +1,171 @@
+# C10 — VIDEO-TO-TRAJECTORY + STRUCTURAL AUGMENTATION.
+# Identical to C7 except for the new `structural_augmentation` block added under `data`.
+# Goal: train the model to read EE pose from frames where the gripper region looks different
+# (blurred / scaled / masked) — simulating the gap between real gt.mp4 and generated video.
+#
+# Three EE-targeted augmentations applied ONLY to source_video (future frames), ONLY during train:
+#   B. EE local blur     (Gaussian blur on gripper patch; prob 0.60; background unchanged)
+#   C. EE local scale    (±20% resize of gripper patch in-place;  prob 0.50)
+#   D. EE cutout         (fill gripper patch with mean colour;     prob 0.30)
+# Plus:
+#   A. Per-frame independent photometric jitter (each of the 8 frames gets its own random factors).
+#
+# All EE positions come from the GT future EE labels (projected to 224×224 via camera intrinsics).
+
+experiment:
+  name: droidex2000_C10_videotraj_structaug
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidex2000_C10_videotraj_structaug
+
+data:
+  dataset_type: openx_droid
+  root: /mnt/pfs/share/shentingrui/dataset/droid-ex/droid_2000_with_extrinsics_filtered
+  episode_glob: "[0-9][0-9][0-9][0-9]"
+  source_video_name: gt.mp4
+  target_video_name: gt.mp4
+  metadata_name: data.json
+  frames_subdir: frames
+  source_sampling: linspace                        # ignored when future_traj is on
+  source_len: 8
+  target_history_len: 1
+  target_offset: 0
+  future_horizon: 5
+  image_size: 224
+  action_stride: 10
+  terminate_positive_window: 5
+  val_ratio: 0.2
+  val_count: 100
+  split_seed: 42
+  gripper_threshold: 0.5
+  window_jitter: {enabled: true, max_offset: 3}
+  augmentation:                                    # per-clip photometric aug (same as C7)
+    enabled: true
+    p: 1.0
+    brightness: 0.1
+    contrast: 0.1
+    saturation: 0.05
+    noise_std: 0.01
+  structural_augmentation:                         # C10: EE-targeted structural aug (new)
+    enabled: true
+    p: 0.9                                         # 90% of training samples get structural aug
+    per_frame_photometric:                         # A: each future frame gets independent color jitter
+      enabled: true
+      brightness: 0.25
+      contrast: 0.25
+      saturation: 0.15
+      noise_std: 0.05
+    ee_blur:                                       # B: Gaussian blur centred on gripper
+      enabled: true
+      size_frac: 0.30                              # patch = 30% of image side (≈67px at 224)
+      sigma: 5.0
+      prob: 0.60                                   # per-frame application probability
+    ee_scale:                                      # C: local scale jitter of gripper patch
+      enabled: true
+      size_frac: 0.30
+      scale_range: 0.20                            # ±20% resize ([0.8×, 1.2×])
+      prob: 0.50
+    ee_cutout:                                     # D: mask gripper region with mean colour
+      enabled: true
+      size_frac: 0.25                              # slightly smaller patch than blur/scale
+      prob: 0.30
+  proprioception:
+    enabled: true
+    source: camera_projection
+    key: cartesian_position
+    step: target
+    dims: 3
+    append_progress: false
+    projection_max_abs: 3.0
+    projection_max_outside_frac: 0.05
+  future_traj:
+    enabled: true
+    num_frames: 8
+    span: 0
+    jitter: 3
+
+action:
+  dim: 10
+  pose_dims: 9
+  mode: regression
+  regression_normalize: true
+  chunk_size: 8
+  num_bins: 64
+  bounds_source: config
+  bounds_low:  [-0.60, -0.60, 0.20, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]
+  bounds_high: [ 0.60,  0.60, 1.20,  1.0,  1.0,  1.0,  1.0,  1.0,  1.0]
+  mapping:
+    type: droid_observation_cartesian_future_delta_pose6d_camera
+    camera_extrinsics_key: ""
+    extrinsics_convention: camera_pose_in_base
+
+model:
+  type: fused_query_reg
+  use_source_video: true
+  backbone:
+    name: dinov2_vitb14
+    pretrained: true
+    freeze: false
+    unfreeze_last_n_blocks: 0
+    local_checkpoint: ""
+    allow_random_init: false
+  image_size: 224
+  source_len: 8
+  target_history_len: 1
+  latent_tokens: 128
+  hidden_dim: 768
+  num_queries: 8
+  num_bins: 64
+  pose_action_dims: 9
+  proprioception_dim: 3
+  query_readout:
+    num_queries: 32
+    segmenter_start: 9
+  point_tracking:
+    use_global: false
+    sequence: false
+  fused:
+    mixer_layers: 4
+    mixer_heads: 8
+    point_tokens: 32
+    ee_tokens: 8
+    dropout: 0.1
+  cross_attn_reg:
+    hidden_dim: 768
+    num_layers: 6
+    heads: 8
+    dropout: 0.1
+    deep_supervision: true
+
+train:
+  seed: 42
+  batch_size: 24
+  epochs: 20
+  num_workers: 24
+  amp: true
+  amp_dtype: bfloat16
+  grad_clip_norm: 1.0
+  shuffle: true
+  optimizer:
+    name: adamw
+    lr: 0.00012
+    backbone_lr_multiplier: 0.3
+    llrd: 0.7
+    weight_decay: 0.05
+    betas: [0.9, 0.95]
+  scheduler:
+    name: cosine
+    warmup_ratio: 0.10
+    min_lr_ratio: 0.05
+  losses:
+    action_weight: 1.0
+    gripper_weight: 0.2
+    terminate_weight: 0.0
+    action_regression_loss: smooth_l1
+    smooth_l1_beta: 0.1
+    deep_supervision_weight: 1.0
+  logging:
+    log_every: 50
+  eval_every_epochs: 2
+  debug:
+    anomaly_detection: false
+    debug_isfinite: false
+    debug_norms: false

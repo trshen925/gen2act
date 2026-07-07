@@ -42,6 +42,21 @@ class ActionCodec:
         scale = (high - low).clamp(min=1e-6)
         return low + bins.float() * scale / max(1, self.num_bins - 1)
 
+    def normalize(self, pose_action: torch.Tensor) -> torch.Tensor:
+        """Clamp raw pose to [low, high] then map per-dim to [-1, 1] (regression targets)."""
+        low = self.low.to(device=pose_action.device, dtype=pose_action.dtype)
+        high = self.high.to(device=pose_action.device, dtype=pose_action.dtype)
+        clipped = torch.minimum(torch.maximum(pose_action, low), high)
+        scale = (high - low).clamp(min=1e-6)
+        return (clipped - low) / scale * 2.0 - 1.0
+
+    def unnormalize(self, norm: torch.Tensor) -> torch.Tensor:
+        """Inverse of normalize: map [-1, 1] back to raw [low, high] units."""
+        low = self.low.to(device=norm.device, dtype=torch.float32)
+        high = self.high.to(device=norm.device, dtype=torch.float32)
+        scale = (high - low).clamp(min=1e-6)
+        return (norm.float() + 1.0) * 0.5 * scale + low
+
 
 def action_loss(logits: torch.Tensor, target_bins: torch.Tensor) -> torch.Tensor:
     return F.cross_entropy(logits.reshape(-1, logits.shape[-1]), target_bins.reshape(-1))

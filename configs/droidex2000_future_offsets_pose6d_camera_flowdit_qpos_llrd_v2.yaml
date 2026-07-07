@@ -1,0 +1,148 @@
+# Step 1 v2 — close the gap to the regression head (Exp5) and videomt (Exp6, all 3 xyz axes learned),
+# now more faithful to GR00T-Dreams IDM. Step 1 IS an IDM (current + future frames -> action chunk):
+# conditioning = future-offset source frames (the future obs) + target_history (the current obs).
+# IDENTICAL to droidex2000_future_offsets_pose6d_camera_flowdit_qpos_llrd EXCEPT these flow-head levers
+# (all pure code changes in flow_dit.py, no data change):
+#   1. [IDM] time_sampling=beta: Beta(1.5,1.0)-biased flow timestep sampling (vs uniform) — matches IDM,
+#      concentrates training on the informative high-noise regime.
+#   2. [IDM] time-conditioned action encoder: the timestep is mixed into the DiT input action tokens
+#      (TimeActionEncoder, like IDM's MultiEmbodimentActionEncoder), so time enters BOTH tokens + adaLN.
+#   3. adaLN conditioning injection: pooled conditioning added to the timestep embedding so every DiT
+#      block's adaLN is conditioned on the inputs (extra lever beyond cross-attention; helps dx/dz).
+#   4. num_eval_samples=8: average 8 flow samples at inference -> conditional-mean estimate, removing
+#      the single-sample variance that inflated MAE on weakly-conditioned dims in Exp8.
+# Also: warmup_ratio 0.03 -> 0.06 (Exp8 had an early train-loss rise = LR a touch high for the DiT).
+
+experiment:
+  name: droidex2000_future_offsets_pose6d_camera_flowdit_qpos_llrd_v2
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidex2000_future_offsets_pose6d_camera_flowdit_qpos_llrd_v2
+
+data:
+  dataset_type: openx_droid
+  root: /mnt/pfs/share/shentingrui/dataset/droid-ex/droid_2000_with_extrinsics_filtered
+  episode_glob: "[0-9][0-9][0-9][0-9]"
+  source_video_name: gt.mp4
+  target_video_name: gt.mp4
+  metadata_name: data.json
+  frames_subdir: frames
+  source_sampling: future_offsets
+  source_future_offsets: [3, 6, 9, 12, 15, 18, 21, 24]
+  source_len: 8
+  target_history_len: 4
+  target_offset: 0
+  future_horizon: 5
+  image_size: 224
+  action_stride: 10
+  terminate_positive_window: 5
+  val_ratio: 0.2
+  val_count: 100
+  split_seed: 42
+  max_episodes: null
+  max_windows: null
+  gripper_threshold: 0.5
+  source_jitter:
+    enabled: false
+    max_offset: 0
+  window_jitter:
+    enabled: true
+    max_offset: 3
+  augmentation:
+    enabled: true
+    p: 1.0
+    brightness: 0.1
+    contrast: 0.1
+    saturation: 0.05
+    noise_std: 0.01
+  proprioception:
+    enabled: true
+    source: camera_projection
+    key: cartesian_position
+    step: target
+    dims: 2
+    projection_max_abs: 3.0
+    projection_max_outside_frac: 0.05
+
+action:
+  dim: 10
+  pose_dims: 9
+  mode: flow
+  regression_normalize: true
+  chunk_size: 4
+  num_bins: 64
+  bounds_source: config
+  bounds_low: [-0.30, -0.30, -0.30, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]
+  bounds_high: [0.30, 0.30, 0.30, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  mapping:
+    type: droid_observation_cartesian_future_delta_pose6d_camera
+    camera_extrinsics_key: ""
+    extrinsics_convention: camera_pose_in_base
+
+model:
+  backbone:
+    name: dinov2_vitb14
+    pretrained: true
+    freeze: false
+    unfreeze_last_n_blocks: 0
+    local_checkpoint: ""
+    allow_random_init: false
+  image_size: 224
+  source_len: 8
+  target_history_len: 4
+  latent_tokens: 128
+  hidden_dim: 768
+  resampler_layers: 3
+  resampler_heads: 8
+  fusion_heads: 8
+  fusion_layers: 3
+  decoder_layers: 2
+  num_queries: 4
+  num_bins: 64
+  pose_action_dims: 9
+  proprioception_dim: 2
+  point_tracking:
+    enabled: false
+  flow_dit:
+    hidden_dim: 1024            # width unchanged (enough); depth doubled 6 -> 12 (was too shallow)
+    num_layers: 12
+    heads: 16
+    num_inference_steps: 16
+    dropout: 0.0
+    num_eval_samples: 8          # average 8 flow samples at inference (conditional-mean estimate)
+    time_sampling: beta          # IDM-style Beta-biased flow timestep sampling (vs uniform)
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+
+train:
+  seed: 42
+  batch_size: 24
+  epochs: 24
+  num_workers: 24
+  amp: true
+  amp_dtype: bfloat16
+  grad_clip_norm: 1.0
+  shuffle: true
+  optimizer:
+    name: adamw
+    lr: 0.0003
+    backbone_lr_multiplier: 0.3
+    llrd: 0.7
+    weight_decay: 0.05
+    betas: [0.9, 0.95]
+  scheduler:
+    name: cosine
+    warmup_ratio: 0.06
+    min_lr_ratio: 0.05
+  losses:
+    action_weight: 1.0
+    gripper_weight: 0.2
+    terminate_weight: 0.0
+    action_regression_loss: smooth_l1
+    smooth_l1_beta: 0.1
+  logging:
+    log_every: 50
+  eval_every_epochs: 2
+  debug:
+    anomaly_detection: false
+    debug_isfinite: false
+    debug_norms: false

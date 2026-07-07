@@ -1,0 +1,145 @@
+# Step 1 IDM-faithful — the flow head is now a close port of GR00T-Dreams IDM (IDM_dump/base.yaml +
+# cross_attention_dit.py): DiT = 8 single-attention BasicTransformerBlocks (interleaved cross/self),
+# AdaLayerNorm timestep conditioning (scale+shift, no zero-gate), a 4-layer VL self-attention mixer
+# over the conditioning tokens, a time-conditioned action encoder, an AdaLayerNorm output head, Beta
+# flow-timestep sampling, velocity prediction + 16-step Euler sampling. Width 1024, 16 heads x 64.
+# Step 1 IS an IDM (current + future frames -> action chunk): conditioning = future-offset source
+# frames (the future obs) + target_history (the current obs), via gen2act DINOv2 resampler/fusion.
+# Everything outside the flow head is IDENTICAL to the camera-frame Exp5 setup.
+
+experiment:
+  name: droidex2000_future_offsets_pose6d_camera_flowdit_qpos_llrd_idm
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidex2000_future_offsets_pose6d_camera_flowdit_qpos_llrd_idm
+
+data:
+  dataset_type: openx_droid
+  root: /mnt/pfs/share/shentingrui/dataset/droid-ex/droid_2000_with_extrinsics_filtered
+  episode_glob: "[0-9][0-9][0-9][0-9]"
+  source_video_name: gt.mp4
+  target_video_name: gt.mp4
+  metadata_name: data.json
+  frames_subdir: frames
+  source_sampling: future_offsets
+  source_future_offsets: [3, 6, 9, 12, 15, 18, 21, 24]
+  source_len: 8
+  target_history_len: 4
+  target_offset: 0
+  future_horizon: 5
+  image_size: 224
+  action_stride: 10
+  terminate_positive_window: 5
+  val_ratio: 0.2
+  val_count: 100
+  split_seed: 42
+  max_episodes: null
+  max_windows: null
+  gripper_threshold: 0.5
+  source_jitter:
+    enabled: false
+    max_offset: 0
+  window_jitter:
+    enabled: true
+    max_offset: 3
+  augmentation:
+    enabled: true
+    p: 1.0
+    brightness: 0.1
+    contrast: 0.1
+    saturation: 0.05
+    noise_std: 0.01
+  proprioception:
+    enabled: true
+    source: camera_projection
+    key: cartesian_position
+    step: target
+    dims: 2
+    projection_max_abs: 3.0
+    projection_max_outside_frac: 0.05
+
+action:
+  dim: 10
+  pose_dims: 9
+  mode: flow
+  regression_normalize: true
+  chunk_size: 4
+  num_bins: 64
+  bounds_source: config
+  bounds_low: [-0.30, -0.30, -0.30, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]
+  bounds_high: [0.30, 0.30, 0.30, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  mapping:
+    type: droid_observation_cartesian_future_delta_pose6d_camera
+    camera_extrinsics_key: ""
+    extrinsics_convention: camera_pose_in_base
+
+model:
+  backbone:
+    name: dinov2_vitb14
+    pretrained: true
+    freeze: false
+    unfreeze_last_n_blocks: 0
+    local_checkpoint: ""
+    allow_random_init: false
+  image_size: 224
+  source_len: 8
+  target_history_len: 4
+  latent_tokens: 128
+  hidden_dim: 768
+  resampler_layers: 3
+  resampler_heads: 8
+  fusion_heads: 8
+  fusion_layers: 3
+  decoder_layers: 2
+  num_queries: 4
+  num_bins: 64
+  pose_action_dims: 9
+  proprioception_dim: 2
+  point_tracking:
+    enabled: false
+  flow_dit:
+    hidden_dim: 1024              # IDM hidden_size
+    num_layers: 8                 # IDM DiT num_layers (single-attention, interleaved)
+    heads: 16                     # 16 x head_dim 64 = 1024
+    num_inference_steps: 16       # IDM num_inference_timesteps
+    dropout: 0.1                  # IDM dropout
+    num_eval_samples: 1           # IDM samples once at inference
+    time_sampling: beta           # IDM Beta(1.5,1.0) flow-timestep sampling
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    vl_mixer_layers: 4            # IDM VL self-attention mixer layers
+    interleave_self_attention: true
+
+train:
+  seed: 42
+  batch_size: 24
+  epochs: 12                      # 12-epoch budget; cosine schedule auto-compresses to decay fully
+                                  # by ep12 so convergence (LR-decay second half) lands within budget.
+  num_workers: 24
+  amp: true
+  amp_dtype: bfloat16
+  grad_clip_norm: 1.0
+  shuffle: true
+  optimizer:
+    name: adamw
+    lr: 0.0003
+    backbone_lr_multiplier: 0.3
+    llrd: 0.7
+    weight_decay: 0.05
+    betas: [0.95, 0.999]          # IDM adam_beta1 0.95, beta2 0.999
+  scheduler:
+    name: cosine
+    warmup_ratio: 0.05
+    min_lr_ratio: 0.05
+  losses:
+    action_weight: 1.0
+    gripper_weight: 0.2
+    terminate_weight: 0.0
+    action_regression_loss: smooth_l1
+    smooth_l1_beta: 0.1
+  logging:
+    log_every: 50
+  eval_every_epochs: 2
+  debug:
+    anomaly_detection: false
+    debug_isfinite: false
+    debug_norms: false

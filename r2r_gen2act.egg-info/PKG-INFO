@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: r2r-gen2act
+Version: 0.1.0
+Summary: Robot-to-robot Gen2Act refactor for Franka/Open-X datasets
+Requires-Python: >=3.11
+Requires-Dist: torch
+Requires-Dist: torchvision
+Requires-Dist: numpy
+Requires-Dist: imageio

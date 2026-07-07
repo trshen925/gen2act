@@ -10,7 +10,7 @@ from r2r_gen2act.modeling.vit import ViTBackbone
 
 
 class Robot2RobotPolicy(nn.Module):
-    def __init__(self, vit: ViTBackbone, source_resampler: PerceiverResampler, target_resampler: PerceiverResampler, fusion: CrossAttentionFusion, decoder: PolicyQueryDecoder, head: ActionHead, source_len: int, target_history_len: int, image_size: int = 224, proprioception_dim: int = 0) -> None:
+    def __init__(self, vit: ViTBackbone, source_resampler: PerceiverResampler, target_resampler: PerceiverResampler, fusion: CrossAttentionFusion, decoder: PolicyQueryDecoder | None, head, source_len: int, target_history_len: int, image_size: int = 224, proprioception_dim: int = 0, action_head_type: str = "regression") -> None:
         super().__init__()
         self.vit = vit
         self.source_resampler = source_resampler
@@ -19,6 +19,9 @@ class Robot2RobotPolicy(nn.Module):
         self.decoder = decoder
         self.head = head
         self.image_size = image_size
+        # "flow_dit" cross-attends directly over the fused token sequence (no single-query decoder
+        # bottleneck); regression/classification heads run through the PolicyQueryDecoder first.
+        self.action_head_type = str(action_head_type)
         dim = vit.hidden_dim
         self.source_time_embed = nn.Parameter(torch.randn(source_len, 1, dim) / dim**0.5)
         self.target_time_embed = nn.Parameter(torch.randn(target_history_len, 1, dim) / dim**0.5)
@@ -43,7 +46,7 @@ class Robot2RobotPolicy(nn.Module):
         patch = patch + time_embed[:t].unsqueeze(0) + stream_embed.view(1, 1, 1, -1)
         return resampler(patch)
 
-    def forward(self, source_video: torch.Tensor, target_history: torch.Tensor, proprioception: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
+    def forward(self, source_video: torch.Tensor, target_history: torch.Tensor, proprioception: torch.Tensor | None = None, action_target: torch.Tensor | None = None, point_track: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
         source_tokens = self.encode_video(source_video, self.source_resampler, self.source_time_embed, self.source_stream_embed)
         target_tokens = self.encode_video(target_history, self.target_resampler, self.target_time_embed, self.target_stream_embed)
         if self.proprioception_proj is not None:
@@ -53,5 +56,13 @@ class Robot2RobotPolicy(nn.Module):
                 proprioception = proprioception.unsqueeze(0)
             target_tokens = target_tokens + self.proprioception_proj(proprioception).unsqueeze(1)
         target_tokens = self.fusion(target_tokens, source_tokens)
+        if self.action_head_type == "flow_dit":
+            # Conditioning = the full fused-target + source token sequence (no decoder bottleneck).
+            cond = torch.cat([target_tokens, source_tokens], dim=1)
+            if self.training:
+                if action_target is None:
+                    raise ValueError("flow_dit head requires action_target during training")
+                return self.head(cond, action_target)
+            return self.head.sample(cond)
         ctx = self.decoder(target_tokens, source_tokens)
         return self.head(ctx)

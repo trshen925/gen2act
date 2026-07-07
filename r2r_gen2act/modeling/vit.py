@@ -57,6 +57,28 @@ class ViTBackbone(nn.Module):
             pass
         return vit_b_16(weights=weights, image_size=self.image_size, num_classes=0)
 
+    def unfreeze_last_blocks(self, n: int) -> int:
+        """Unfreeze the last n transformer blocks (+ final norm) of a timm ViT backbone.
+
+        Returns the number of blocks actually unfrozen. No-op for backbones without `.blocks`
+        (e.g. debug_small). Pair with a small backbone_lr_multiplier so these layers actually train.
+        """
+        n = int(n)
+        if n <= 0:
+            return 0
+        blocks = getattr(self.backend, "blocks", None)
+        if blocks is None:
+            return 0
+        n = min(n, len(blocks))
+        for blk in blocks[-n:]:
+            for p in blk.parameters():
+                p.requires_grad_(True)
+        final_norm = getattr(self.backend, "norm", None)
+        if final_norm is not None:
+            for p in final_norm.parameters():
+                p.requires_grad_(True)
+        return n
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.name == "debug_small":
             tokens = self.backend(x).transpose(1, 2).contiguous()

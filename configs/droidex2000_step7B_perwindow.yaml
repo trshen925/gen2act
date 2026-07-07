@@ -1,0 +1,146 @@
+# Step 7-B — per-window ALIGNED conditions (direction B). The step7 (global) run barely beat baseline
+# because its source video (linspace whole demo) and point tracks (whole trajectory) were per-EPISODE
+# constants: identical across all windows of an episode, so they could not pin the per-window action.
+# Fix: make both conditions per-WINDOW (sampled relative to target_step):
+#   - source video: future-offset local clip [target_step + 0,4,8,...,28] (the demo around this window)
+#   - point tracks: window=[0,24] -> the point motion over [target_step, target_step+24] (this window)
+# Same fused model as step7 (query readout + self-attn mix + cross-attn regression + deep supervision).
+# Note: per-window alignment uses future-relative sampling (like Exp15's leak), the price of aligning.
+
+experiment:
+  name: droidex2000_step7B_perwindow
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidex2000_step7B_perwindow
+
+data:
+  dataset_type: openx_droid
+  root: /mnt/pfs/share/shentingrui/dataset/droid-ex/droid_2000_with_extrinsics_filtered
+  episode_glob: "[0-9][0-9][0-9][0-9]"
+  source_video_name: gt.mp4
+  target_video_name: gt.mp4
+  metadata_name: data.json
+  frames_subdir: frames
+  source_sampling: future_offsets                 # per-window local demo clip (was linspace global)
+  source_future_offsets: [0, 4, 8, 12, 16, 20, 24, 28]
+  source_len: 8
+  target_history_len: 1                           # current frame only (= target_step)
+  target_offset: 0
+  future_horizon: 5
+  image_size: 224
+  action_stride: 10
+  terminate_positive_window: 5
+  val_ratio: 0.2
+  val_count: 100
+  split_seed: 42
+  gripper_threshold: 0.5
+  source_jitter: {enabled: false, max_offset: 0}
+  window_jitter: {enabled: true, max_offset: 3}
+  augmentation:
+    enabled: true
+    p: 1.0
+    brightness: 0.1
+    contrast: 0.1
+    saturation: 0.05
+    noise_std: 0.01
+  proprioception:
+    enabled: true
+    source: camera_projection
+    key: cartesian_position
+    step: target
+    dims: 3
+    projection_max_abs: 3.0
+    projection_max_outside_frac: 0.05
+  point_tracking:
+    enabled: true
+    num_points: 10
+    num_time: 60
+    window: [0, 24]                               # per-window point motion (was whole-episode global)
+
+action:
+  dim: 10
+  pose_dims: 9
+  mode: regression
+  regression_normalize: true
+  chunk_size: 4
+  num_bins: 64
+  bounds_source: config
+  bounds_low: [-0.30, -0.30, -0.30, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]
+  bounds_high: [0.30, 0.30, 0.30, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  mapping:
+    type: droid_observation_cartesian_future_delta_pose6d_camera
+    camera_extrinsics_key: ""
+    extrinsics_convention: camera_pose_in_base
+
+model:
+  type: fused_query_reg
+  backbone:
+    name: dinov2_vitb14
+    pretrained: true
+    freeze: false
+    unfreeze_last_n_blocks: 0
+    local_checkpoint: ""
+    allow_random_init: false
+  image_size: 224
+  source_len: 8
+  target_history_len: 1
+  latent_tokens: 128
+  hidden_dim: 768
+  num_queries: 4
+  num_bins: 64
+  pose_action_dims: 9
+  proprioception_dim: 3
+  query_readout:
+    num_queries: 32
+    segmenter_start: 9
+  point_tracking:
+    num_points: 10
+    num_time: 60
+    hidden_dim: 384
+    heads: 6
+    attn_layers: 2
+  fused:
+    mixer_layers: 4
+    mixer_heads: 8
+    point_tokens: 32
+    ee_tokens: 8
+    dropout: 0.1
+  cross_attn_reg:
+    hidden_dim: 768
+    num_layers: 6
+    heads: 8
+    dropout: 0.1
+    deep_supervision: true
+
+train:
+  seed: 42
+  batch_size: 24
+  epochs: 20
+  num_workers: 24
+  amp: true
+  amp_dtype: bfloat16
+  grad_clip_norm: 1.0
+  shuffle: true
+  optimizer:
+    name: adamw
+    lr: 0.00012                  # lowered from 3e-4: step7B collapsed at peak LR (down to 0.17 then back to 0.24)
+    backbone_lr_multiplier: 0.3
+    llrd: 0.7
+    weight_decay: 0.05
+    betas: [0.9, 0.95]
+  scheduler:
+    name: cosine
+    warmup_ratio: 0.10          # longer warmup to stabilize the mixer + many condition tokens
+    min_lr_ratio: 0.05
+  losses:
+    action_weight: 1.0
+    gripper_weight: 0.2
+    terminate_weight: 0.0
+    action_regression_loss: smooth_l1
+    smooth_l1_beta: 0.1
+    deep_supervision_weight: 1.0
+  logging:
+    log_every: 50
+  eval_every_epochs: 2
+  debug:
+    anomaly_detection: false
+    debug_isfinite: false
+    debug_norms: false

@@ -1,0 +1,125 @@
+# Action-chunk + multi-query + partial-finetune variant on droid-2000-new.
+# Derived from droid2000new_future5_delta_pose6d_regression_qpos_..._100m with:
+#   1. Multi-query decoder: 4 query tokens (was 1) -> opens the output bottleneck.
+#   2. Action chunk: predict 4 future steps (cumulative delta at +5,+10,+15,+20), one per query.
+#   3. Partial finetune: unfreeze the last 4 DINOv2 blocks (+final norm), backbone lr x0.1.
+#   4. latent_tokens 32 -> 128 (wider information bottleneck).
+# Rotation: 6D continuous rep (Zhou et al.). pose = xyz(3)+6D(6)=9; action chunk = [4, 10] incl. gripper.
+# Intended leak kept: source_video = gt.mp4 (full episode incl. future frames).
+
+experiment:
+  name: droid2000new_future5_chunk4_pose6d_regression_qpos_ft4dinov2_latent128_aug50
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droid2000new_future5_chunk4_pose6d_regression_qpos_ft4dinov2_latent128_aug50
+
+data:
+  dataset_type: openx_droid
+  root: /mnt/pfs/share/shentingrui/dataset/droid-2000-new
+  episode_glob: "[0-9][0-9][0-9][0-9]"
+  source_video_name: gt.mp4
+  target_video_name: gt.mp4
+  metadata_name: data.json
+  source_sampling: linspace
+  source_len: 8
+  target_history_len: 4
+  target_offset: 0
+  future_horizon: 5
+  image_size: 224
+  action_stride: 10
+  terminate_positive_window: 5
+  val_ratio: 0.2
+  val_count: 100          # hold out exactly 100 episodes as the inference/eval set
+  split_seed: 42
+  max_episodes: null
+  max_windows: null
+  gripper_threshold: 0.5
+  source_jitter:
+    enabled: true
+    max_offset: 5
+  window_jitter:
+    enabled: true
+    max_offset: 3
+  augmentation:
+    enabled: true
+    p: 1.0
+    brightness: 0.1
+    contrast: 0.1
+    saturation: 0.05
+    noise_std: 0.01
+  proprioception:
+    enabled: true
+    source: observations
+    key: joint_position
+    step: target
+    dims: 7
+
+action:
+  dim: 10
+  pose_dims: 9
+  mode: regression
+  regression_normalize: true
+  chunk_size: 4
+  num_bins: 64
+  bounds_source: config
+  bounds_low: [-0.10, -0.10, -0.10, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]
+  bounds_high: [0.10, 0.10, 0.10, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  mapping:
+    type: droid_observation_cartesian_future_delta_pose6d
+
+model:
+  backbone:
+    name: dinov2_vitb14
+    pretrained: true
+    freeze: true
+    unfreeze_last_n_blocks: 4
+    local_checkpoint: ""
+    allow_random_init: false
+  image_size: 224
+  source_len: 8
+  target_history_len: 4
+  latent_tokens: 128
+  hidden_dim: 768
+  resampler_layers: 3
+  resampler_heads: 8
+  fusion_heads: 8
+  fusion_layers: 3
+  decoder_layers: 2
+  num_queries: 4
+  num_bins: 64
+  pose_action_dims: 9
+  proprioception_dim: 7
+  point_tracking:
+    enabled: false
+
+train:
+  seed: 42
+  batch_size: 32
+  epochs: 50
+  num_workers: 4          # effective workers = num_workers x n_gpus; keep modest to avoid
+                          # spawning too many ffmpeg video readers (pid/thread limit)
+  amp: true
+  amp_dtype: bfloat16
+  grad_clip_norm: 1.0
+  shuffle: true
+  optimizer:
+    name: adamw
+    lr: 0.0003
+    backbone_lr_multiplier: 0.1
+    weight_decay: 0.05
+    betas: [0.9, 0.95]
+  scheduler:
+    name: cosine
+    warmup_ratio: 0.03
+    min_lr_ratio: 0.05
+  losses:
+    action_weight: 1.0
+    gripper_weight: 0.2
+    terminate_weight: 0.0
+    action_regression_loss: smooth_l1
+    smooth_l1_beta: 0.1
+  logging:
+    log_every: 50
+  eval_every_epochs: 2     # run inference on the held-out set every 2 epochs (periodic)
+  debug:
+    anomaly_detection: false
+    debug_isfinite: false
+    debug_norms: false

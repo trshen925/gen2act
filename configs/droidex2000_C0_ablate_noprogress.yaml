@@ -1,0 +1,157 @@
+# C0 — HONEST deployment setting + SEQUENCE trajectory + LOCALIZATION anchors.
+# Goal: in an honest, deployable setting (NO aligned future frames — no future_offsets), test whether
+# "whole-episode trajectory as a per-timestep SEQUENCE + localization anchors" lets the fused model
+# beat Exp16 (the honest-setting failure baseline) without the leak that made Exp17 work.
+#
+# vs the prior fused runs:
+#   - Exp16 (failed, honest): source=linspace global, point track=POOLED latent, NO localization.
+#   - Exp17 (worked but LEAKS): source=future_offsets aligned, point track=window slice (= future leak).
+#   - C0 (this):  source=linspace global (honest), point track=WHOLE-episode SEQUENCE (per-timestep
+#                 tokens), localization = current frame + EE(u,v,depth) + task progress.
+# C0 = take Exp16's "pooled track / no localization" and swap in "sequence track / localization
+# anchors", keeping everything else honest (deployable; no aligned future frames).
+#
+# 5 conditions (all 768-dim, each with a learnable type embedding):
+#   (1) demo video : gt.mp4 linspace 8 frames -> query-in-backbone DINOv2 (32 q/frame) = 8*32=256 tok
+#   (2) demo track : track_points.npy WHOLE episode, 32 timesteps -> per-timestep token seq      = 32 tok
+#   (3) current    : target_step frame -> query-in-backbone DINOv2                                = 32 tok
+#   (4)(5) EE+prog : (u,v,depth)+progress -> MLP -> ee tokens   (progress appended as 4th prop dim) = 8 tok
+# = 328 condition tokens -> 4-layer self-attn mixer -> 6-layer cross-attn regression + deep supervision.
+
+experiment:
+  name: droidex2000_C0_ablate_noprogress
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidex2000_C0_ablate_noprogress
+
+data:
+  dataset_type: openx_droid
+  root: /mnt/pfs/share/shentingrui/dataset/droid-ex/droid_2000_with_extrinsics_filtered
+  episode_glob: "[0-9][0-9][0-9][0-9]"
+  source_video_name: gt.mp4
+  target_video_name: gt.mp4
+  metadata_name: data.json
+  frames_subdir: frames
+  source_sampling: linspace                       # HONEST: whole demo, 8 frames (no aligned future frames)
+  source_len: 8
+  target_history_len: 1                           # current frame only (= target_step)
+  target_offset: 0
+  future_horizon: 5
+  image_size: 224
+  action_stride: 10
+  terminate_positive_window: 5
+  val_ratio: 0.2
+  val_count: 100
+  split_seed: 42
+  gripper_threshold: 0.5
+  source_jitter: {enabled: false, max_offset: 0}
+  window_jitter: {enabled: true, max_offset: 3}
+  augmentation:
+    enabled: true
+    p: 1.0
+    brightness: 0.1
+    contrast: 0.1
+    saturation: 0.05
+    noise_std: 0.01
+  proprioception:
+    enabled: true
+    source: camera_projection
+    key: cartesian_position
+    step: target
+    dims: 3                                        # (u_norm, v_norm, camera-depth z)
+    append_progress: false                         # ABLATION: drop progress localization anchor
+    projection_max_abs: 3.0
+    projection_max_outside_frac: 0.05
+  point_tracking:
+    enabled: true
+    num_points: 10
+    num_time: 32                                   # 32 timesteps of the WHOLE trajectory
+    sequence: true                                 # per-timestep token sequence (NOT pooled)
+    # NOTE: no `window` key -> whole-episode global trajectory (honest; localization comes from anchors)
+
+action:
+  dim: 10
+  pose_dims: 9
+  mode: regression
+  regression_normalize: true
+  chunk_size: 4
+  num_bins: 64
+  bounds_source: config
+  bounds_low: [-0.30, -0.30, -0.30, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]
+  bounds_high: [0.30, 0.30, 0.30, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  mapping:
+    type: droid_observation_cartesian_future_delta_pose6d_camera
+    camera_extrinsics_key: ""
+    extrinsics_convention: camera_pose_in_base
+
+model:
+  type: fused_query_reg
+  backbone:
+    name: dinov2_vitb14
+    pretrained: true
+    freeze: false
+    unfreeze_last_n_blocks: 0
+    local_checkpoint: ""
+    allow_random_init: false
+  image_size: 224
+  source_len: 8
+  target_history_len: 1
+  latent_tokens: 128
+  hidden_dim: 768
+  num_queries: 4
+  num_bins: 64
+  pose_action_dims: 9
+  proprioception_dim: 3                            # ABLATION: 3 (u,v,depth), no progress
+  query_readout:
+    num_queries: 32
+    segmenter_start: 9
+  point_tracking:
+    num_points: 10
+    num_time: 32
+    hidden_dim: 384
+    sequence: true                                 # build PointTrajSeqEncoder (per-timestep tokens)
+  fused:
+    mixer_layers: 4
+    mixer_heads: 8
+    point_tokens: 32                               # = num_time in sequence mode (ignored otherwise)
+    ee_tokens: 8
+    dropout: 0.1
+  cross_attn_reg:
+    hidden_dim: 768
+    num_layers: 6
+    heads: 8
+    dropout: 0.1
+    deep_supervision: true
+
+train:
+  seed: 42
+  batch_size: 24
+  epochs: 20
+  num_workers: 24
+  amp: true
+  amp_dtype: bfloat16
+  grad_clip_norm: 1.0
+  shuffle: true
+  optimizer:
+    name: adamw
+    lr: 0.00012                  # low LR: multi-condition fusion is LR-sensitive (Exp17 needed 1.2e-4)
+    backbone_lr_multiplier: 0.3
+    llrd: 0.7
+    weight_decay: 0.05
+    betas: [0.9, 0.95]
+  scheduler:
+    name: cosine
+    warmup_ratio: 0.10
+    min_lr_ratio: 0.05
+  losses:
+    action_weight: 1.0
+    gripper_weight: 0.2
+    terminate_weight: 0.0
+    action_regression_loss: smooth_l1
+    smooth_l1_beta: 0.1
+    deep_supervision_weight: 1.0
+  logging:
+    log_every: 50
+  eval_every_epochs: 2
+  debug:
+    anomaly_detection: false
+    debug_isfinite: false
+    debug_norms: false

@@ -1,0 +1,141 @@
+# Step 7: fused-conditioning flow-matching policy.
+#   reference video (8 demo frames, linspace) -> VideoMAEv2 -> video tokens
+#   current real image (target_history[-1])   -> DINOv2     -> image tokens
+#   tracked EE points [10,60,2]                -> PointLatentEncoder -> point tokens
+#   current EE 2D image coord (u,v)            -> linear     -> ee token
+#   cond -> FlowMatchingDiTHead -> action chunk.   NO t+H future-frame input.
+# Requires Phase C preprocessing outputs ({episode}/track_points.npy) for all training episodes.
+
+experiment:
+  name: droidex2000_fused_flowdit_videomae_points
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidex2000_fused_flowdit_videomae_points
+
+data:
+  dataset_type: openx_droid
+  root: /mnt/pfs/share/shentingrui/dataset/droid-ex/droid_2000_with_extrinsics_filtered
+  episode_glob: "[0-9][0-9][0-9][0-9]"
+  source_video_name: gt.mp4
+  target_video_name: gt.mp4
+  metadata_name: data.json
+  frames_subdir: frames
+  source_sampling: linspace          # reference video = whole demo, 8 frames (incl. future)
+  source_len: 8
+  target_history_len: 4
+  target_offset: 0
+  future_horizon: 5
+  image_size: 224
+  action_stride: 10
+  terminate_positive_window: 5
+  val_ratio: 0.2
+  val_count: 100
+  split_seed: 42
+  gripper_threshold: 0.5
+  source_jitter: {enabled: false, max_offset: 0}
+  window_jitter: {enabled: true, max_offset: 3}
+  augmentation:
+    enabled: true
+    p: 1.0
+    brightness: 0.1
+    contrast: 0.1
+    saturation: 0.05
+    noise_std: 0.01
+  proprioception:
+    enabled: true
+    source: camera_projection
+    key: cartesian_position
+    step: target
+    dims: 2
+    projection_max_abs: 3.0
+    projection_max_outside_frac: 0.05
+  point_tracking:
+    enabled: true
+    num_points: 10
+    num_time: 60
+
+action:
+  dim: 10
+  pose_dims: 9
+  mode: flow
+  regression_normalize: true
+  chunk_size: 4
+  num_bins: 64
+  bounds_source: config
+  bounds_low: [-0.30, -0.30, -0.30, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]
+  bounds_high: [0.30, 0.30, 0.30, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  mapping:
+    type: droid_observation_cartesian_future_delta_pose6d_camera
+    camera_extrinsics_key: ""
+    extrinsics_convention: camera_pose_in_base
+
+model:
+  type: fused_flow
+  backbone:
+    name: dinov2_vitb14
+    pretrained: true
+    freeze: false
+    unfreeze_last_n_blocks: 0
+    local_checkpoint: ""
+    allow_random_init: false
+  image_size: 224
+  source_len: 8
+  target_history_len: 4
+  latent_tokens: 64
+  hidden_dim: 768
+  resampler_layers: 3
+  resampler_heads: 8
+  num_queries: 4
+  num_bins: 64
+  pose_action_dims: 9
+  proprioception_dim: 2
+  video_encoder:
+    checkpoint: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/model_zoo/vit_b_k710_dl_from_giant.pth
+    all_frames: 16
+    tubelet_size: 2
+    freeze: true
+    num_video_tokens: 4
+  point_tracking:
+    num_points: 10
+    num_time: 60
+    hidden_dim: 384
+    heads: 6
+    attn_layers: 2
+  flow_dit:
+    hidden_dim: 1024
+    num_layers: 6
+    heads: 16
+    num_inference_steps: 16
+    dropout: 0.0
+
+train:
+  seed: 42
+  batch_size: 20
+  epochs: 24
+  num_workers: 20
+  amp: true
+  amp_dtype: bfloat16
+  grad_clip_norm: 1.0
+  shuffle: true
+  optimizer:
+    name: adamw
+    lr: 0.0003
+    backbone_lr_multiplier: 0.3
+    llrd: 0.7
+    weight_decay: 0.05
+    betas: [0.9, 0.95]
+  scheduler:
+    name: cosine
+    warmup_ratio: 0.03
+    min_lr_ratio: 0.05
+  losses:
+    action_weight: 1.0
+    gripper_weight: 0.2
+    terminate_weight: 0.0
+    action_regression_loss: smooth_l1
+    smooth_l1_beta: 0.1
+  logging:
+    log_every: 50
+  eval_every_epochs: 2
+  debug:
+    anomaly_detection: false
+    debug_isfinite: false
+    debug_norms: false

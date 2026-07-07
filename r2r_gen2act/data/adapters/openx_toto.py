@@ -23,7 +23,9 @@ class OpenXTotoDataset(WindowedRobotDataset):
         if max_episodes not in (None, ""):
             robot_dirs = robot_dirs[: int(max_episodes)]
         ids = [d.name for d in robot_dirs]
-        _, val_ids = split_episode_ids(ids, float(self.data_cfg.get("val_ratio", 0.2)), int(self.data_cfg.get("split_seed", 42)))
+        val_count = self.data_cfg.get("val_count")
+        val_count = None if val_count in (None, "") else int(val_count)
+        _, val_ids = split_episode_ids(ids, float(self.data_cfg.get("val_ratio", 0.2)), int(self.data_cfg.get("split_seed", 42)), val_count)
         episodes = []
         for robot_dir in robot_dirs:
             split = "val" if robot_dir.name in val_ids else "train"

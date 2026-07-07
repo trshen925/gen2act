@@ -1,0 +1,128 @@
+# P0 fix: break the regression mode-collapse by switching the action head to the paper's
+# DISCRETIZED CLASSIFICATION (256 bins/dim + cross-entropy), per Gen2Act (arXiv:2409.16283).
+# Derived verbatim from droid2000new_future5_chunk4_pose6d_REGRESSION_..._latent128_aug50 with ONLY:
+#   1. action.mode: regression -> classification
+#   2. action.num_bins / model.num_bins: 64 -> 256  (matches paper; xyz bin ~0.78mm over +/-0.10m)
+# Everything else (data, leak, backbone, chunk4, latent128, losses weights) is IDENTICAL so this is a
+# clean A/B against the regression run. In classification mode the regression-only knobs
+# (regression_normalize, action_regression_loss, smooth_l1_beta) are inert and ignored by losses.py.
+# Rationale: regression on the multimodal +5/10/15/20-step future-delta target collapsed to the
+# marginal mean (xyz R^2~0.10/0.00/0.20, rotation R^2<=0, identical on train and val). Discretization
+# + cross-entropy lets the head represent multimodal action distributions instead of averaging them.
+
+experiment:
+  name: droid2000new_future5_chunk4_pose6d_cls256_qpos_ft4dinov2_latent128_aug50
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droid2000new_future5_chunk4_pose6d_cls256_qpos_ft4dinov2_latent128_aug50
+
+data:
+  dataset_type: openx_droid
+  root: /mnt/pfs/share/shentingrui/dataset/droid-2000-new
+  episode_glob: "[0-9][0-9][0-9][0-9]"
+  source_video_name: gt.mp4
+  target_video_name: gt.mp4
+  metadata_name: data.json
+  source_sampling: linspace
+  source_len: 8
+  target_history_len: 4
+  target_offset: 0
+  future_horizon: 5
+  image_size: 224
+  action_stride: 10
+  terminate_positive_window: 5
+  val_ratio: 0.2
+  val_count: 100          # hold out exactly 100 episodes as the inference/eval set
+  split_seed: 42
+  max_episodes: null
+  max_windows: null
+  gripper_threshold: 0.5
+  source_jitter:
+    enabled: true
+    max_offset: 5
+  window_jitter:
+    enabled: true
+    max_offset: 3
+  augmentation:
+    enabled: true
+    p: 1.0
+    brightness: 0.1
+    contrast: 0.1
+    saturation: 0.05
+    noise_std: 0.01
+  proprioception:
+    enabled: true
+    source: observations
+    key: joint_position
+    step: target
+    dims: 7
+
+action:
+  dim: 10
+  pose_dims: 9
+  mode: classification          # P0: was regression
+  regression_normalize: true    # inert in classification mode
+  chunk_size: 4
+  num_bins: 256                 # P0: was 64 (paper uses 256 bins/dim)
+  bounds_source: config
+  bounds_low: [-0.10, -0.10, -0.10, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]
+  bounds_high: [0.10, 0.10, 0.10, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  mapping:
+    type: droid_observation_cartesian_future_delta_pose6d
+
+model:
+  backbone:
+    name: dinov2_vitb14
+    pretrained: true
+    freeze: true
+    unfreeze_last_n_blocks: 4
+    local_checkpoint: ""
+    allow_random_init: false
+  image_size: 224
+  source_len: 8
+  target_history_len: 4
+  latent_tokens: 128
+  hidden_dim: 768
+  resampler_layers: 3
+  resampler_heads: 8
+  fusion_heads: 8
+  fusion_layers: 3
+  decoder_layers: 2
+  num_queries: 4
+  num_bins: 256                 # P0: was 64 (must match action.num_bins)
+  pose_action_dims: 9
+  proprioception_dim: 7
+  point_tracking:
+    enabled: false
+
+train:
+  seed: 42
+  batch_size: 32
+  epochs: 6
+  num_workers: 4          # effective workers = num_workers x n_gpus; keep modest to avoid
+                          # spawning too many ffmpeg video readers (pid/thread limit)
+  amp: true
+  amp_dtype: bfloat16
+  grad_clip_norm: 1.0
+  shuffle: true
+  optimizer:
+    name: adamw
+    lr: 0.0003
+    backbone_lr_multiplier: 0.1
+    weight_decay: 0.05
+    betas: [0.9, 0.95]
+  scheduler:
+    name: cosine
+    warmup_ratio: 0.03
+    min_lr_ratio: 0.05
+  losses:
+    action_weight: 1.0
+    gripper_weight: 0.2
+    terminate_weight: 0.0
+    action_regression_loss: smooth_l1   # inert in classification mode
+    smooth_l1_beta: 0.1                 # inert in classification mode
+  logging:
+    log_every: 50
+  eval_every_epochs: 2     # run inference on the held-out set every 2 epochs (periodic)
+  debug:
+    anomaly_detection: false
+    debug_isfinite: false
+    debug_norms: false

@@ -1,0 +1,149 @@
+# C12 — QUERY-IN-MIXER + CURRENT-OBS FULL PATCH TOKENS (Experiment 1 of new direction).
+#
+# Architecture changes vs C11-nodepth:
+#   1. current_full_patch=True: current obs frame → all 256 DINOv2 patch tokens (no readout queries).
+#      Source video (8 frames) still uses query-in-backbone readout (32 tok/frame = 256 tok total).
+#      Mixer input: 256 (src) + 256 (cur full patch) + 8 (ee) + 8 (action queries) = 528 tokens.
+#   2. joint_action=True: 8 learnable action queries ARE ADDED TO THE MIXER alongside condition tokens.
+#      After mixing, last 8 tokens are read out via act_out_norm → linear → tanh → action chunk.
+#      No separate CrossAttnRegressionDecoder (no deep supervision in this ablation).
+#
+# Task: same as C11 — video-to-trajectory (future frames → absolute camera-frame EE poses).
+# Dataset: PointWorld-DROID 3000 episodes (same as C11).
+# Goal: quantify whether full-patch current obs + joint mixer beats C11-nodepth (cross-attn decoder).
+
+experiment:
+  name: pointworld3000_C12_fullpatch_jointtok
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/pointworld3000_C12_fullpatch_jointtok
+
+data:
+  dataset_type: pointworld_droid
+  root: /mnt/pfs/share/shentingrui/dataset/pointworld-droid-3000
+  source_video_name: gt.mp4
+  target_video_name: gt.mp4
+  metadata_name: data.json
+  frames_subdir: frames
+  source_sampling: linspace
+  source_len: 8
+  target_history_len: 1
+  target_offset: 0
+  future_horizon: 5
+  image_size: 224
+  action_stride: 10
+  terminate_positive_window: 5
+  val_ratio: 0.05
+  val_count: 100
+  split_seed: 42
+  gripper_threshold: 0.5
+  window_jitter: {enabled: true, max_offset: 3}
+  augmentation:
+    enabled: true
+    p: 1.0
+    brightness: 0.1
+    contrast: 0.1
+    saturation: 0.05
+    noise_std: 0.01
+  depth:
+    enabled: false
+  proprioception:
+    enabled: true
+    source: camera_projection
+    key: cartesian_position
+    step: target
+    dims: 3
+    append_progress: false
+    projection_max_abs: 3.0
+    projection_max_outside_frac: 0.05
+  future_traj:
+    enabled: true
+    num_frames: 8
+    span: 0
+    jitter: 3
+
+action:
+  dim: 10
+  pose_dims: 9
+  mode: regression
+  regression_normalize: true
+  chunk_size: 8
+  num_bins: 64
+  bounds_source: config
+  bounds_low:  [-0.60, -0.60, 0.20, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]
+  bounds_high: [ 0.60,  0.60, 1.20,  1.0,  1.0,  1.0,  1.0,  1.0,  1.0]
+  mapping:
+    type: droid_observation_cartesian_future_delta_pose6d_camera
+    camera_extrinsics_key: ""
+    extrinsics_convention: camera_pose_in_base
+
+model:
+  type: fused_query_reg
+  use_source_video: true
+  # C12 new flags
+  current_full_patch: true        # current obs → all 256 DINOv2 patch tokens (not 32 readout)
+  joint_action: true              # action queries go INTO the mixer; no CrossAttnDecoder
+  backbone:
+    name: dinov2_vitb14
+    pretrained: true
+    freeze: false
+    unfreeze_last_n_blocks: 0
+    local_checkpoint: ""
+    allow_random_init: false
+  image_size: 224
+  source_len: 8
+  target_history_len: 1
+  latent_tokens: 128
+  hidden_dim: 768
+  num_queries: 8
+  num_bins: 64
+  pose_action_dims: 9
+  proprioception_dim: 3
+  query_readout:
+    num_queries: 32               # still used for source video readout
+    segmenter_start: 9
+  point_tracking:
+    use_global: false
+    sequence: false
+  fused:
+    mixer_layers: 4
+    mixer_heads: 8
+    point_tokens: 32
+    ee_tokens: 8
+    dropout: 0.1
+  # cross_attn_reg is NOT built when joint_action=true (omitted intentionally)
+  depth:
+    enabled: false
+
+train:
+  seed: 42
+  batch_size: 12
+  epochs: 20
+  num_workers: 16
+  amp: true
+  amp_dtype: bfloat16
+  grad_clip_norm: 1.0
+  shuffle: true
+  optimizer:
+    name: adamw
+    lr: 0.00012
+    backbone_lr_multiplier: 0.3
+    llrd: 0.7
+    weight_decay: 0.05
+    betas: [0.9, 0.95]
+  scheduler:
+    name: cosine
+    warmup_ratio: 0.10
+    min_lr_ratio: 0.05
+  losses:
+    action_weight: 1.0
+    gripper_weight: 0.2
+    terminate_weight: 0.0
+    action_regression_loss: smooth_l1
+    smooth_l1_beta: 0.1
+    deep_supervision_weight: 1.0   # no aux_action_preds in joint_action mode; this is a no-op
+  logging:
+    log_every: 50
+  eval_every_epochs: 2
+  debug:
+    anomaly_detection: false
+    debug_isfinite: false
+    debug_norms: false

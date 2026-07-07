@@ -19,6 +19,14 @@ def build_dataset(cfg: dict, split: str) -> Dataset:
         from r2r_gen2act.data.adapters.openx_toto import OpenXTotoDataset
 
         return OpenXTotoDataset(cfg, split=split)
+    if dtype == "pointworld_droid":
+        from r2r_gen2act.data.adapters.pointworld_droid import PointWorldDroidDataset
+
+        return PointWorldDroidDataset(cfg, split=split)
+    if dtype == "droid_ex_out":
+        from r2r_gen2act.data.adapters.droid_ex_out import DroidExOutDataset
+
+        return DroidExOutDataset(cfg, split=split)
     raise ValueError(f"Unknown dataset_type={dtype}")
 
 

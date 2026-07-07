@@ -1,0 +1,136 @@
+# Step 1 — CONTINUE the pure-video query-flow run from its ep12 checkpoint at a small LR for 8 more
+# epochs (= overall ep13..20). Loss was still dropping fast at ep11/12 (the careful learning happens
+# at low LR), so we warm-restart from latest.pt and keep LR small (5e-5, 1/6 of the original 3e-4).
+# eval uses num_eval_samples=16 (single-sample eval underestimates flow, see EXPERIMENTS.md Exp 13).
+# Identical model/data to droidex2000_purevideo_queryflow_idm.
+
+experiment:
+  name: droidex2000_purevideo_queryflow_idm_cont20
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidex2000_purevideo_queryflow_idm_cont20
+
+data:
+  dataset_type: openx_droid
+  root: /mnt/pfs/share/shentingrui/dataset/droid-ex/droid_2000_with_extrinsics_filtered
+  episode_glob: "[0-9][0-9][0-9][0-9]"
+  source_video_name: gt.mp4
+  target_video_name: gt.mp4
+  metadata_name: data.json
+  frames_subdir: frames
+  source_sampling: future_offsets
+  source_future_offsets: [0, 5, 10, 15, 20]
+  source_len: 5
+  target_history_len: 4
+  target_offset: 0
+  future_horizon: 5
+  image_size: 224
+  action_stride: 10
+  terminate_positive_window: 5
+  val_ratio: 0.2
+  val_count: 100
+  split_seed: 42
+  max_episodes: null
+  max_windows: null
+  gripper_threshold: 0.5
+  source_jitter:
+    enabled: false
+    max_offset: 0
+  window_jitter:
+    enabled: true
+    max_offset: 3
+  augmentation:
+    enabled: true
+    p: 1.0
+    brightness: 0.1
+    contrast: 0.1
+    saturation: 0.05
+    noise_std: 0.01
+  proprioception:
+    enabled: false
+
+action:
+  dim: 10
+  pose_dims: 9
+  mode: flow
+  regression_normalize: true
+  chunk_size: 4
+  num_bins: 64
+  bounds_source: config
+  bounds_low: [-0.30, -0.30, -0.30, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]
+  bounds_high: [0.30, 0.30, 0.30, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  mapping:
+    type: droid_observation_cartesian_future_delta_pose6d_camera
+    camera_extrinsics_key: ""
+    extrinsics_convention: camera_pose_in_base
+
+model:
+  type: query_flow
+  backbone:
+    name: dinov2_vitb14
+    pretrained: true
+    freeze: false
+    unfreeze_last_n_blocks: 0
+    local_checkpoint: ""
+    allow_random_init: false
+  image_size: 224
+  source_len: 5
+  target_history_len: 4
+  latent_tokens: 128
+  hidden_dim: 768
+  num_queries: 4
+  num_bins: 64
+  pose_action_dims: 9
+  proprioception_dim: 0
+  point_tracking:
+    enabled: false
+  query_readout:
+    num_queries: 16
+    segmenter_start: 9
+    single_stream: true
+  flow_dit:
+    hidden_dim: 1024
+    num_layers: 8
+    heads: 16
+    num_inference_steps: 16
+    dropout: 0.1
+    num_eval_samples: 16
+    time_sampling: beta
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    vl_mixer_layers: 4
+    interleave_self_attention: true
+
+train:
+  seed: 42
+  resume_checkpoint: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidex2000_purevideo_queryflow_idm/latest.pt
+  batch_size: 32
+  epochs: 8                     # continuation epochs (= overall ep13..20)
+  num_workers: 24
+  amp: true
+  amp_dtype: bfloat16
+  grad_clip_norm: 1.0
+  shuffle: true
+  optimizer:
+    name: adamw
+    lr: 0.00005                 # small LR (1/6 of original 3e-4) for the careful low-LR phase
+    backbone_lr_multiplier: 0.3
+    llrd: 0.7
+    weight_decay: 0.05
+    betas: [0.95, 0.999]
+  scheduler:
+    name: cosine
+    warmup_ratio: 0.03
+    min_lr_ratio: 0.1
+  losses:
+    action_weight: 1.0
+    gripper_weight: 0.2
+    terminate_weight: 0.0
+    action_regression_loss: smooth_l1
+    smooth_l1_beta: 0.1
+  logging:
+    log_every: 50
+  eval_every_epochs: 2
+  debug:
+    anomaly_detection: false
+    debug_isfinite: false
+    debug_norms: false

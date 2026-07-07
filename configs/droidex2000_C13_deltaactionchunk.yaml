@@ -1,0 +1,142 @@
+# C13 on droid-ex — VIDEO-TO-DELTA-ACTIONCHUNK.
+#
+# Architecture: same as droidex2000_C12 (current_full_patch=True, joint_action=True).
+# Task change vs C12:
+#   C12: future_traj=True  → source_video = future frames, target = abs camera-frame EE pose
+#   C13: future_traj=False → source_video = linspace demo,  target = delta action chunk
+#
+# "Video-to-ActionChunk": given demo video (whole episode, linspace) + current obs,
+# predict 8-step delta action chunk (ΔXY Z + 6D-rot delta in camera frame + gripper).
+# This is the deployable BC direction: source_video has no future-frame leakage.
+# Dataset: droid-ex (same as C7/C12).
+
+experiment:
+  name: droidex2000_C13_deltaactionchunk
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidex2000_C13_deltaactionchunk
+
+data:
+  dataset_type: openx_droid
+  root: /mnt/pfs/share/shentingrui/dataset/droid-ex/droid_2000_with_extrinsics_filtered
+  episode_glob: "[0-9][0-9][0-9][0-9]"
+  source_video_name: gt.mp4
+  target_video_name: gt.mp4
+  metadata_name: data.json
+  frames_subdir: frames
+  source_sampling: linspace
+  source_len: 8
+  target_history_len: 1
+  target_offset: 0
+  future_horizon: 5
+  image_size: 224
+  action_stride: 10
+  terminate_positive_window: 5
+  val_ratio: 0.2
+  val_count: 100
+  split_seed: 42
+  gripper_threshold: 0.5
+  window_jitter: {enabled: true, max_offset: 3}
+  augmentation:
+    enabled: true
+    p: 1.0
+    brightness: 0.1
+    contrast: 0.1
+    saturation: 0.05
+    noise_std: 0.01
+  proprioception:
+    enabled: true
+    source: camera_projection
+    key: cartesian_position
+    step: target
+    dims: 3
+    append_progress: false
+    projection_max_abs: 3.0
+    projection_max_outside_frac: 0.05
+  future_traj:
+    enabled: false    # delta action chunk; source_video = linspace demo (deployable)
+
+action:
+  dim: 10
+  pose_dims: 9
+  mode: regression
+  regression_normalize: true
+  chunk_size: 8
+  num_bins: 64
+  bounds_source: config
+  bounds_low:  [-0.30, -0.30, -0.30, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]
+  bounds_high: [ 0.30,  0.30,  0.30,  1.0,  1.0,  1.0,  1.0,  1.0,  1.0]
+  mapping:
+    type: droid_observation_cartesian_future_delta_pose6d_camera
+    camera_extrinsics_key: ""
+    extrinsics_convention: camera_pose_in_base
+
+model:
+  type: fused_query_reg
+  use_source_video: true
+  current_full_patch: true
+  joint_action: true
+  backbone:
+    name: dinov2_vitb14
+    pretrained: true
+    freeze: false
+    unfreeze_last_n_blocks: 0
+    local_checkpoint: ""
+    allow_random_init: false
+  image_size: 224
+  source_len: 8
+  target_history_len: 1
+  latent_tokens: 128
+  hidden_dim: 768
+  num_queries: 8
+  num_bins: 64
+  pose_action_dims: 9
+  proprioception_dim: 3
+  query_readout:
+    num_queries: 32
+    segmenter_start: 9
+  point_tracking:
+    use_global: false
+    sequence: false
+  fused:
+    mixer_layers: 4
+    mixer_heads: 8
+    point_tokens: 32
+    ee_tokens: 8
+    dropout: 0.1
+  depth:
+    enabled: false
+
+train:
+  seed: 42
+  resume_full_checkpoint: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidex2000_C13_deltaactionchunk/latest.pt
+  batch_size: 12
+  epochs: 20
+  num_workers: 16
+  amp: true
+  amp_dtype: bfloat16
+  grad_clip_norm: 1.0
+  shuffle: true
+  optimizer:
+    name: adamw
+    lr: 0.00012
+    backbone_lr_multiplier: 0.3
+    llrd: 0.7
+    weight_decay: 0.05
+    betas: [0.9, 0.95]
+  scheduler:
+    name: cosine
+    warmup_ratio: 0.10
+    min_lr_ratio: 0.05
+  losses:
+    action_weight: 1.0
+    gripper_weight: 0.2
+    terminate_weight: 0.0
+    action_regression_loss: smooth_l1
+    smooth_l1_beta: 0.1
+    deep_supervision_weight: 1.0
+  logging:
+    log_every: 50
+  eval_every_epochs: 2
+  debug:
+    anomaly_detection: false
+    debug_isfinite: false
+    debug_norms: false

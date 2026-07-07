@@ -31,9 +31,26 @@ class PolicyPredictor:
             proprioception = proprioception.to(self.device)
             if proprioception.dim() == 1:
                 proprioception = proprioception.unsqueeze(0)
-        outputs = self.model(source, target, proprioception)
+        point_track = batch.get("point_track")
+        if torch.is_tensor(point_track):
+            point_track = point_track.to(self.device)
+            if point_track.dim() == 3:
+                point_track = point_track.unsqueeze(0)
+        extra = {}
+        ptc = batch.get("point_track_causal")
+        if torch.is_tensor(ptc):
+            ptc = ptc.to(self.device)
+            if ptc.dim() == 3:
+                ptc = ptc.unsqueeze(0)
+            extra["point_track_causal"] = ptc
+        outputs = self.model(source, target, proprioception, None, point_track, **extra)
         if "action_pred" in outputs:
-            pose = outputs["action_pred"].cpu()
+            pred = outputs["action_pred"]
+            action_mode = str(self.cfg.get("action", {}).get("mode", ""))
+            # flow head emits normalized [-1,1] actions; regression may too (regression_normalize).
+            if action_mode == "flow" or bool(self.cfg.get("action", {}).get("regression_normalize", False)):
+                pred = self.codec.unnormalize(pred)
+            pose = pred.cpu()
             bins = None
         else:
             bins = outputs["action_logits"].argmax(dim=-1)
@@ -43,6 +60,11 @@ class PolicyPredictor:
         result = {"pose_action": pose, "gripper_prob": gripper_prob, "terminate_prob": terminate_prob}
         if bins is not None:
             result["action_bins"] = bins.cpu()
+        # 6D rotation rep: orthonormalize the predicted [3:9] into a valid rotation matrix.
+        if "pose6d" in str(self.cfg.get("action", {}).get("mapping", {}).get("type", "")) and pose.shape[-1] >= 9:
+            from r2r_gen2act.data.action.rotation import sixd_to_matrix
+            result["rotation_matrix"] = sixd_to_matrix(pose[..., 3:9]).cpu()
+            result["pose_xyz"] = pose[..., :3]
         return result
 
 
@@ -65,6 +87,8 @@ def predict_dataset_window(cfg: dict, checkpoint_path: str | Path, split: str, e
     }
     if "action_bins" in pred:
         result["action_bins"] = pred["action_bins"][0].tolist()
+    if "rotation_matrix" in pred:
+        result["rotation_matrix"] = pred["rotation_matrix"][0].tolist()
     if save_path:
         path = Path(save_path)
         path.parent.mkdir(parents=True, exist_ok=True)
