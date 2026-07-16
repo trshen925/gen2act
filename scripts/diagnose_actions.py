@@ -42,7 +42,13 @@ def main() -> None:
     codec = build_action_codec(cfg)
     pose_dims = codec.pose_dims
     ds = build_dataset(cfg, args.split)
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=8)
+    # C24: variable source-frame count → bucket batches by k so source_video collates.
+    if bool(cfg["data"].get("dynamic_source", {}).get("enabled", False)) and getattr(ds, "window_k", lambda: None)() is not None:
+        from r2r_gen2act.data.bucket_sampler import KBucketBatchSampler
+        bsampler = KBucketBatchSampler(ds.window_k(), args.batch_size, shuffle=False)
+        loader = DataLoader(ds, batch_sampler=bsampler, num_workers=8)
+    else:
+        loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=8)
     model = build_policy(cfg).to(device)
     load_checkpoint(args.checkpoint, model, device, strict=False)
     model.eval()
@@ -60,6 +66,9 @@ def main() -> None:
             point_track = point_track.to(device) if torch.is_tensor(point_track) else None
             ptc = batch.get("point_track_causal")
             kw = {"point_track_causal": ptc.to(device)} if torch.is_tensor(ptc) else {}
+            sdt = batch.get("source_dt")
+            if torch.is_tensor(sdt):
+                kw["source_dt"] = sdt.to(device)
             out = model(src, tgt_h, prop, None, point_track, **kw)
             pred = out["action_pred"]
             if normalize:

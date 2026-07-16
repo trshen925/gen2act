@@ -177,6 +177,14 @@ def load_config(path: str | Path) -> dict[str, Any]:
             raw = _parse_simple_yaml(text)
         else:
             raw = yaml.safe_load(text)
-    cfg = deep_update(default_config(), raw or {})
+    raw = raw or {}
+    base_path = raw.pop("_base_", None)
+    if base_path:
+        base_path = Path(base_path)
+        if not base_path.is_absolute():
+            base_path = path.parent / base_path
+        cfg = deep_update(load_config(base_path), raw)
+    else:
+        cfg = deep_update(default_config(), raw)
     cfg["_config_path"] = str(path)
     return cfg

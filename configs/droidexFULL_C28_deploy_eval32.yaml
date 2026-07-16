@@ -1,0 +1,13 @@
+# Deployment/evaluation view of C28 ep17. Keep the original architecture,
+# use the formal 32-step/16-sample inference recipe, and freeze the dataset
+# boundary that existed when C28 was trained.
+
+_base_: droidexFULL_C28_bigdit_scratch.yaml
+
+data:
+  max_episodes: 35696
+
+model:
+  flow_dit:
+    num_inference_steps: 32
+    num_eval_samples: 16

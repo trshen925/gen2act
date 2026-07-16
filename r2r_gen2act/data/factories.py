@@ -27,6 +27,10 @@ def build_dataset(cfg: dict, split: str) -> Dataset:
         from r2r_gen2act.data.adapters.droid_ex_out import DroidExOutDataset
 
         return DroidExOutDataset(cfg, split=split)
+    if dtype == "robolab_sim":
+        from r2r_gen2act.data.adapters.robolab_sim import RobolabSimDataset
+
+        return RobolabSimDataset(cfg, split=split)
     raise ValueError(f"Unknown dataset_type={dtype}")
 
 

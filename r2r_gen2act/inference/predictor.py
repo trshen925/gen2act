@@ -43,6 +43,12 @@ class PolicyPredictor:
             if ptc.dim() == 3:
                 ptc = ptc.unsqueeze(0)
             extra["point_track_causal"] = ptc
+        source_dt = batch.get("source_dt")
+        if torch.is_tensor(source_dt):
+            source_dt = source_dt.to(self.device)
+            if source_dt.dim() == 1:
+                source_dt = source_dt.unsqueeze(0)
+            extra["source_dt"] = source_dt
         outputs = self.model(source, target, proprioception, None, point_track, **extra)
         if "action_pred" in outputs:
             pred = outputs["action_pred"]

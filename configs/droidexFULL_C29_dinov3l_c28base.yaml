@@ -1,0 +1,39 @@
+# C29: isolated C28 backbone ablation.
+# Only the visual backbone changes: DINOv2-B/14 -> DINOv3-L/16.
+# DINOv3-L has 24 blocks, so segmenter_start=21 preserves C28's design of
+# injecting the 32 readout queries for the final three backbone blocks.
+# Supports any number of GPUs. batch_size is per GPU; four GPUs reproduce
+# C28's global batch 12, while three/five GPUs use global batch 9/15.
+
+_base_: droidexFULL_C28_bigdit_scratch.yaml
+
+data:
+  # Freeze C28's exact candidate pool: sorted directories 00000..35695.
+  # The C28 split seed/val_count are inherited, so this freezes both train and val.
+  # After C28's calibration filters: train=34008 episodes / 355461 windows,
+  # val=488 episodes / 5218 windows (12 of the 500 held-out IDs are filtered).
+  max_episodes: 35696
+
+experiment:
+  name: droidexFULL_C29_dinov3l_c28base
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidexFULL_C29_dinov3l_c28base
+
+model:
+  backbone:
+    name: dinov3_vitl16
+    pretrained: true
+    freeze: false
+    unfreeze_last_n_blocks: 0
+    local_checkpoint: ""
+    allow_random_init: false
+  hidden_dim: 1024
+  query_readout:
+    num_queries: 32
+    segmenter_start: 21
+
+train:
+  batch_size: 3
+  num_workers: 4
+  distributed:
+    find_unused_parameters: false
+    broadcast_buffers: false

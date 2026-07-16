@@ -1,0 +1,7 @@
+_base_: droidexFULL_C30_cont12_lr3e5.yaml
+
+model:
+  flow_dit:
+    num_inference_steps: 32
+    num_eval_samples: 16
+

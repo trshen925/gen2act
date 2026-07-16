@@ -237,6 +237,10 @@ def _build_fused_query_flow(cfg: dict):
         image_size=int(model_cfg["image_size"]), point_encoder_causal=point_encoder_causal,
         aux_traj_cfg=model_cfg.get("aux_traj", {}) or {},
         aux_progress_cfg=model_cfg.get("aux_progress", {}) or {},
+        dt_time_cfg=model_cfg.get("dt_time_embed", {}) or {},
+        current_full_patch=bool(model_cfg.get("current_full_patch", False)),
+        max_source_len=int(model_cfg.get("max_source_len", model_cfg["source_len"])),
+        pad_source=bool(model_cfg.get("pad_source", False)),
     )
     n_tr = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[fused_query_flow] total={sum(p.numel() for p in model.parameters())/1e6:.1f}M trainable={n_tr/1e6:.1f}M "

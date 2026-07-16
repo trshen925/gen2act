@@ -1,0 +1,40 @@
+# C30: isolated C28 action-head capacity ablation.
+# DINOv2-B and every data/input setting remain identical to C28; only the
+# DiT depth and conditioning VL-mixer depth change (12/6 -> 16/8).
+# Supports any number of GPUs. batch_size is per GPU; four GPUs reproduce
+# C28's global batch 12, while three/five GPUs use global batch 9/15.
+
+_base_: droidexFULL_C28_bigdit_scratch.yaml
+
+data:
+  # Freeze C28's exact candidate pool: sorted directories 00000..35695.
+  # The C28 split seed/val_count are inherited, so this freezes both train and val.
+  # After C28's calibration filters: train=34008 episodes / 355461 windows,
+  # val=488 episodes / 5218 windows (12 of the 500 held-out IDs are filtered).
+  max_episodes: 35696
+
+experiment:
+  name: droidexFULL_C30_dit16_mixer8_c28base
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidexFULL_C30_dit16_mixer8_c28base
+
+model:
+  flow_dit:
+    hidden_dim: 1024
+    num_layers: 16
+    heads: 16
+    num_inference_steps: 16
+    num_eval_samples: 8
+    time_sampling: beta
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    vl_mixer_layers: 8
+    interleave_self_attention: true
+    dropout: 0.1
+
+train:
+  batch_size: 3
+  num_workers: 4
+  distributed:
+    find_unused_parameters: false
+    broadcast_buffers: false

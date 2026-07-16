@@ -80,6 +80,18 @@ class WindowedRobotDataset(Dataset):
         source_float_cfg = self.data_cfg.get("source_float", {})
         self.source_float_enabled = bool(source_float_cfg.get("enabled", False))
         self.source_float_frac = float(source_float_cfg.get("float_frac", 0.2))
+        # C20: Δt time-conditioning — emit per-frame real seconds-since-previous-sampled-frame so the
+        # model knows the demo's pacing (fixed 8 frames, but a 3s clip vs 30s clip → very different Δt).
+        self.dt_time_enabled = bool(self.data_cfg.get("dt_time_embed", {}).get("enabled", False))
+        self.fps = float(self.data_cfg.get("fps", 15))
+        # C24: dynamic source-frame count for (near-)constant real Δt across clips. Sample every
+        # `stride` frames → k = clamp(round(num_frames/stride), min, max); linspace(0,n-1,k). At 15fps,
+        # stride=15 → Δt target 1.0s. k depends only on num_steps (→ bucketable).
+        dyn_cfg = self.data_cfg.get("dynamic_source", {})
+        self.dynamic_source_enabled = bool(dyn_cfg.get("enabled", False))
+        self.dynamic_source_stride = float(dyn_cfg.get("stride", 15))
+        self.dynamic_source_min = int(dyn_cfg.get("min", 4))
+        self.dynamic_source_max = int(dyn_cfg.get("max", 16))
         self.load_videos = bool(self.data_cfg.get("load_videos", True))
         # Optional pre-decoded frames: read <video>.parent/<frames_subdir>/<idx:06d>.<ext> instead of
         # randomly seeking the mp4 (see scripts/extract_frames.py). Much faster; empty = use mp4.
@@ -103,6 +115,20 @@ class WindowedRobotDataset(Dataset):
         self._samples = build_windows(self._episodes, self.source_len, self.target_history_len, self.target_offset, self.action_stride, max_windows, self.effective_future_horizon)
         self._episode_by_id = {e.episode_id: e for e in self._episodes}
         self._video_cache: dict[Path, Any] = {}
+        # C24: per-window source-frame count k (depends only on episode num_steps) — for bucket sampling.
+        if self.dynamic_source_enabled:
+            k_by_ep = {e.episode_id: self._dynamic_source_len(e.num_steps) for e in self._episodes}
+            self._window_k = [k_by_ep[eid] for eid, _ in self._samples]
+        else:
+            self._window_k = None
+
+    def window_k(self) -> list[int] | None:
+        """Per-window source-frame count k (for KBucketBatchSampler). None if not dynamic."""
+        return self._window_k
+
+    def _dynamic_source_len(self, num_steps: int) -> int:
+        k = round(int(num_steps) / max(1e-6, self.dynamic_source_stride))
+        return int(min(max(k, self.dynamic_source_min), self.dynamic_source_max))
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -289,16 +315,18 @@ class WindowedRobotDataset(Dataset):
                 raise ValueError(f"data.source_future_offsets length ({len(offsets)}) must match source_len ({self.source_len})")
             indices = [int(target_step) + off for off in offsets]
         else:
+            # C24: dynamic frame count for constant Δt (k = clamp(round(n/stride), min, max)).
+            k = self._dynamic_source_len(episode.num_steps) if self.dynamic_source_enabled else self.source_len
             lo, hi = 0, source_length - 1
             # C18: float the linspace window start/end by up to float_frac of the clip (train only),
-            # so the 8 sampled frames cover a different span each epoch → demo diversity.
+            # so the sampled frames cover a different span each epoch → demo diversity.
             if self.source_float_enabled and self.split == "train" and source_length > 2:
                 span = self.source_float_frac * (source_length - 1)
                 lo = int(round(float(torch.rand(()).item()) * span))
                 hi = int(round((source_length - 1) - float(torch.rand(()).item()) * span))
-                if hi - lo < self.source_len:
+                if hi - lo < k:
                     lo, hi = 0, source_length - 1
-            indices = [int(round(x)) for x in np.linspace(lo, hi, self.source_len)]
+            indices = [int(round(x)) for x in np.linspace(lo, hi, k)]
         return self._jitter_source_indices(indices, source_length)
 
     def _read_source_video(self, episode: EpisodeRecord, start_index: int) -> torch.Tensor:
@@ -435,8 +463,10 @@ class WindowedRobotDataset(Dataset):
             "metadata": {"source_video_path": str(episode.source_video_path), "target_video_path": str(episode.target_video_path)},
         }
         if self.load_videos:
+            _src_idx = None
             if future_idx is not None:
                 source_video = self._read_video_indices(episode.source_video_path, future_idx)
+                _src_idx = list(future_idx)
             elif self.aux_traj_enabled:
                 # compute indices once so both the video and traj_target use the same frames
                 _src_idx = self._compute_source_indices(episode, start_index)
@@ -444,7 +474,15 @@ class WindowedRobotDataset(Dataset):
                 traj_target = np.stack([self._camera_abs_pose_at(payload, int(i)) for i in _src_idx]).astype(np.float32)
                 sample["traj_target"] = torch.as_tensor(traj_target, dtype=torch.float32)  # [source_len, 10]
             else:
-                source_video = self._read_source_video(episode, start_index)
+                _src_idx = self._compute_source_indices(episode, start_index)
+                source_video = self._read_video_indices(episode.source_video_path, _src_idx)
+            # C20: per-frame Δt (real seconds since previous sampled frame; first frame = 0). Lets the
+            # model tell a fast short demo from a slow long one (same 8 frames, different pacing).
+            if self.dt_time_enabled and _src_idx is not None:
+                idx_arr = np.asarray(_src_idx, dtype=np.float32)
+                dt = np.zeros_like(idx_arr)
+                dt[1:] = np.diff(idx_arr) / max(1.0, float(self.fps))
+                sample["source_dt"] = torch.as_tensor(dt, dtype=torch.float32)  # [source_len]
             target_history = self._read_target_history(episode, start_index)
             if self.split == "train":
                 source_video = apply_image_augmentation(source_video, self.augmentation_cfg)

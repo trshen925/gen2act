@@ -1,0 +1,176 @@
+# C24 on droid-ex-3000-out — dynamic source frames (constant Δt) + NO explicit Δt input.
+#
+# Reverts arch to C22 (DiT 12 layers, vl_mixer 6). Instead of fixed 8 frames + explicit Δt (C20/C22),
+# sample every ~15 frames so all clips have (near-)constant real Δt≈1.0s: k=clamp(round(n/15),4,16),
+# linspace. Δt input REMOVED (constant Δt makes pacing implicit). Variable k → bucket batching.
+# Data locked to old 4579 clips (max_episodes) for a clean comparison vs C22 (1.672 @ 32/16 sampling).
+
+experiment:
+  name: droidex3000out_C26_padembed_ft
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidex3000out_C26_padembed_ft
+
+data:
+  dataset_type: droid_ex_out
+  root: /mnt/pfs/data/shentingrui/droid-ex-3000-out
+  episode_glob: "[0-9][0-9][0-9][0-9][0-9]"
+  max_episodes: 4579
+  source_video_name: rgb.mp4
+  target_video_name: rgb.mp4
+  metadata_name: meta.json
+  frames_subdir: frames
+  intrinsics_json: /mnt/pfs/data/shentingrui/KarlP-droid/intrinsics.json
+  fps: 15
+  dt_time_embed:
+    enabled: true      # C25: Δt input ADDED BACK (isolate variable-k effect from the Δt effect)
+  dynamic_source:
+    enabled: true
+    stride: 15         # sample every 15 frames → Δt target 1.0s at 15fps
+    min: 4
+    max: 16
+  source_sampling: linspace
+  source_len: 4        # floor (= dynamic min); build_windows requires >= this many frames
+  target_history_len: 1
+  target_offset: 0
+  future_horizon: 5
+  image_size: 224
+  action_stride: 10
+  terminate_positive_window: 5
+  val_count: 300
+  split_seed: 42
+  gripper_threshold: 0.5
+  window_jitter: {enabled: true, max_offset: 3}
+  augmentation:
+    enabled: true
+    p: 1.0
+    brightness: 0.1
+    contrast: 0.1
+    saturation: 0.05
+    noise_std: 0.01
+  proprioception:
+    enabled: true
+    source: camera_projection
+    key: cartesian_position
+    step: target
+    dims: 3
+    append_progress: false
+    projection_max_abs: 3.0
+    projection_max_outside_frac: 0.05
+  future_traj:
+    enabled: false
+  aux_traj:
+    enabled: true
+  source_float:
+    enabled: true
+    float_frac: 0.2
+
+action:
+  dim: 10
+  pose_dims: 9
+  mode: flow
+  regression_normalize: true
+  chunk_size: 8
+  num_bins: 64
+  bounds_source: config
+  bounds_low:  [-0.30, -0.30, -0.30, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]
+  bounds_high: [ 0.30,  0.30,  0.30,  1.0,  1.0,  1.0,  1.0,  1.0,  1.0]
+  mapping:
+    type: droid_observation_cartesian_future_delta_pose6d_camera
+    camera_extrinsics_key: ""
+    extrinsics_convention: camera_pose_in_base
+
+model:
+  type: fused_query_flow
+  use_source_video: true
+  max_source_len: 16     # source_time_embed sized for k_max=16
+  pad_source: true       # C26: pad every case to 16 frames with a learnable pad-frame embedding
+  backbone:
+    name: dinov2_vitb14
+    pretrained: true
+    freeze: false
+    unfreeze_last_n_blocks: 0
+    local_checkpoint: ""
+    allow_random_init: false
+  image_size: 224
+  source_len: 4
+  target_history_len: 1
+  latent_tokens: 128
+  hidden_dim: 768
+  num_queries: 8
+  num_bins: 64
+  pose_action_dims: 9
+  proprioception_dim: 3
+  query_readout:
+    num_queries: 32
+    segmenter_start: 9
+  point_tracking:
+    use_global: false
+    sequence: false
+  fused:
+    mixer_layers: 4
+    mixer_heads: 8
+    point_tokens: 32
+    ee_tokens: 8
+    dropout: 0.1
+
+  flow_dit:
+    hidden_dim: 1024
+    num_layers: 12       # C22 arch (reverted from C23's 16)
+    heads: 16
+    num_inference_steps: 16
+    num_eval_samples: 8
+    time_sampling: beta
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    vl_mixer_layers: 6   # C22 arch (reverted from C23's 8)
+    interleave_self_attention: true
+    dropout: 0.1
+
+  aux_traj:
+    enabled: true
+  dt_time_embed:
+    enabled: true        # C25: Δt encoder on
+    num_freqs: 16
+    max_sec: 5.0
+
+train:
+  seed: 42
+  # C26: continue from C25 (dynamic-k + Δt) + add learnable pad-frame embedding (pad every case to 16).
+  # strict=False: loads all shared weights, pad_frame_embed random-init. Tests whether padding-to-16
+  # (uniform source_time_embed training) recovers the ~0.23cm variable-length gap vs C22 (1.672).
+  resume_checkpoint: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidex3000out_C25_dynk_dt_ft/latest.pt
+  batch_size: 12
+  epochs: 10
+  num_workers: 16
+  amp: true
+  amp_dtype: bfloat16
+  grad_clip_norm: 1.0
+  shuffle: true
+  optimizer:
+    name: adamw
+    lr: 0.00003
+    backbone_lr_multiplier: 0.3
+    llrd: 0.7
+    weight_decay: 0.05
+    betas: [0.9, 0.95]
+  scheduler:
+    name: cosine
+    warmup_ratio: 0.05
+    min_lr_ratio: 0.05
+  losses:
+    action_weight: 1.0
+    gripper_weight: 0.2
+    terminate_weight: 0.0
+    action_regression_loss: smooth_l1
+    smooth_l1_beta: 0.1
+    deep_supervision_weight: 1.0
+    aux_traj_weight: 0.1
+    aux_traj_bounds_low:  [-0.60, -0.60, 0.20, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]
+    aux_traj_bounds_high: [ 0.60,  0.60, 1.20,  1.0,  1.0,  1.0,  1.0,  1.0,  1.0]
+  logging:
+    log_every: 50
+  eval_every_epochs: 1
+  debug:
+    anomaly_detection: false
+    debug_isfinite: false
+    debug_norms: false

@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from torch.utils.data.distributed import DistributedSampler
 
 from r2r_gen2act.config.schema import validate_config
@@ -20,6 +20,22 @@ from r2r_gen2act.training.losses import compute_losses
 from r2r_gen2act.training.seed import seed_everything
 
 
+class DistributedEvalSampler(Sampler[int]):
+    """Shard evaluation indices without DistributedSampler's duplicate padding."""
+
+    def __init__(self, dataset, rank: int, world_size: int) -> None:
+        self.dataset = dataset
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+
+    def __iter__(self):
+        return iter(range(self.rank, len(self.dataset), self.world_size))
+
+    def __len__(self) -> int:
+        remaining = len(self.dataset) - self.rank
+        return max(0, (remaining + self.world_size - 1) // self.world_size)
+
+
 def _init_distributed() -> tuple[int, int, int, bool]:
     """Read torchrun env. Returns (rank, local_rank, world_size, is_dist). Single-process when
     not launched by torchrun (WORLD_SIZE<=1)."""
@@ -28,6 +44,8 @@ def _init_distributed() -> tuple[int, int, int, bool]:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     is_dist = world_size > 1
     if is_dist and not dist.is_initialized():
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
         dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
     return rank, local_rank, world_size, is_dist
 
@@ -227,6 +245,10 @@ def run_epoch(model, loader, codec, cfg, device, optimizer=None, train: bool = T
                 ck = batch.get("camera_K")
                 if ck is not None:
                     extra["camera_K"] = ck
+                # C20: per-frame Δt (source-video pacing) for the flow policy's Δt time-conditioning
+                sdt = batch.get("source_dt")
+                if sdt is not None:
+                    extra["source_dt"] = sdt.to(device)
                 outputs = model(batch.get("source_video"), batch.get("target_history"), proprioception, action_target, point_track, **extra)
                 losses = compute_losses(outputs, batch, codec, cfg)
                 if not torch.isfinite(losses["loss"]):
@@ -262,10 +284,14 @@ def train(cfg: dict, device: str | None = None) -> Path:
         torch.autograd.set_detect_anomaly(True)
     seed_everything(int(cfg["train"].get("seed", 42)) + rank)
     if torch.cuda.is_available():
-        if device and device not in ("cuda", "gpu"):
+        if is_dist:
+            # torchrun owns device placement. Honouring a shared --device=cuda:0
+            # here would put every local rank on GPU 0.
+            device_obj = torch.device(f"cuda:{local_rank}")
+        elif device and device not in ("cuda", "gpu"):
             device_obj = torch.device(device)
         else:
-            device_obj = torch.device(f"cuda:{local_rank % torch.cuda.device_count()}")
+            device_obj = torch.device("cuda:0")
         torch.cuda.set_device(device_obj)
     else:
         device_obj = torch.device(device) if device else torch.device("cpu")
@@ -287,12 +313,39 @@ def train(cfg: dict, device: str | None = None) -> Path:
     batch_size = int(cfg["train"]["batch_size"])  # per-GPU
     num_workers = int(cfg["train"].get("num_workers", 0))
     pin = device_obj.type == "cuda"
-    train_sampler = DistributedSampler(train_ds, shuffle=bool(cfg["train"].get("shuffle", True))) if is_dist else None
-    train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=train_sampler, shuffle=(bool(cfg["train"].get("shuffle", True)) and not is_dist), num_workers=num_workers, pin_memory=pin)
-    # Inference set (held-out cases) is evaluated on the main rank only.
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin)
+    # C24: dynamic source frames → variable k per window → bucket batches by k (uniform k per batch
+    # so source_video/traj_target collate cleanly). Only single-GPU supported.
+    dynamic_source = bool(cfg["data"].get("dynamic_source", {}).get("enabled", False)) and train_ds.window_k() is not None
+    if dynamic_source:
+        if is_dist:
+            raise NotImplementedError("dynamic_source (bucket sampling) not implemented for distributed training")
+        from r2r_gen2act.data.bucket_sampler import KBucketBatchSampler
+        train_bsampler = KBucketBatchSampler(train_ds.window_k(), batch_size, shuffle=bool(cfg["train"].get("shuffle", True)))
+        val_bsampler = KBucketBatchSampler(val_ds.window_k(), batch_size, shuffle=False)
+        train_loader = DataLoader(train_ds, batch_sampler=train_bsampler, num_workers=num_workers, pin_memory=pin)
+        val_loader = DataLoader(val_ds, batch_sampler=val_bsampler, num_workers=num_workers, pin_memory=pin)
+    else:
+        train_sampler = DistributedSampler(
+            train_ds,
+            shuffle=bool(cfg["train"].get("shuffle", True)),
+            seed=int(cfg["train"].get("seed", 42)),
+        ) if is_dist else None
+        # Do not use DistributedSampler for evaluation: it pads with duplicates
+        # when len(val) is not divisible by world_size, changing metric weights.
+        val_sampler = DistributedEvalSampler(val_ds, rank, world_size) if is_dist else None
+        train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=train_sampler, shuffle=(bool(cfg["train"].get("shuffle", True)) and not is_dist), num_workers=num_workers, pin_memory=pin)
+        val_loader = DataLoader(val_ds, batch_size=batch_size, sampler=val_sampler, shuffle=False, num_workers=num_workers, pin_memory=pin)
 
-    model = build_policy(cfg).to(device_obj)
+    # Let rank 0 populate pretrained-weight caches first. This avoids every local
+    # process concurrently downloading/writing a multi-GB DINO checkpoint.
+    model = None
+    if not is_dist or is_main:
+        model = build_policy(cfg).to(device_obj)
+    if is_dist:
+        dist.barrier()
+        if not is_main:
+            model = build_policy(cfg).to(device_obj)
+    assert model is not None
     raw_model = model
     # Optional warm-restart: load weights from a prior checkpoint and continue training (fresh
     # optimizer + a new, typically smaller-LR schedule). Used to keep training a converged run at
@@ -304,7 +357,13 @@ def train(cfg: dict, device: str | None = None) -> Path:
         if is_main:
             print(f"[resume] loaded weights from {resume_ckpt} (fresh optimizer/scheduler)")
     if is_dist:
-        model = DDP(model, device_ids=[device_obj.index] if device_obj.type == "cuda" else None, find_unused_parameters=False)
+        dist_cfg = cfg["train"].get("distributed", {}) or {}
+        model = DDP(
+            model,
+            device_ids=[device_obj.index] if device_obj.type == "cuda" else None,
+            find_unused_parameters=bool(dist_cfg.get("find_unused_parameters", False)),
+            broadcast_buffers=bool(dist_cfg.get("broadcast_buffers", False)),
+        )
     opt_cfg = cfg["train"].get("optimizer", {})
     optimizer = torch.optim.AdamW(_param_groups(raw_model, cfg), betas=tuple(opt_cfg.get("betas", [0.9, 0.95])))
     scheduler = _build_scheduler(optimizer, cfg, len(train_loader))
@@ -313,7 +372,11 @@ def train(cfg: dict, device: str | None = None) -> Path:
     if is_main:
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "config_snapshot.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-        print(f"world_size={world_size} per_gpu_batch={batch_size} train_episodes={len(train_ds.episodes)} infer_episodes={len(val_ds.episodes)} train_windows={len(train_ds)} infer_windows={len(val_ds)}")
+        print(
+            f"world_size={world_size} per_gpu_batch={batch_size} global_batch={batch_size * world_size} "
+            f"train_episodes={len(train_ds.episodes)} infer_episodes={len(val_ds.episodes)} "
+            f"train_windows={len(train_ds)} infer_windows={len(val_ds)}"
+        )
 
     eval_every = max(1, int(cfg["train"].get("eval_every_epochs", 1)))
     epochs = int(cfg["train"].get("epochs", 1))
@@ -365,10 +428,19 @@ def train(cfg: dict, device: str | None = None) -> Path:
 
         do_eval = (epoch % eval_every == 0) or (epoch == epochs)
         val_metrics = None
-        if do_eval and is_main:
+        if do_eval:
             raw_model.eval()
             with torch.no_grad():
-                val_metrics = run_epoch(raw_model, val_loader, codec, cfg, device_obj, None, train=False, world_size=1)
+                val_metrics = run_epoch(
+                    raw_model,
+                    val_loader,
+                    codec,
+                    cfg,
+                    device_obj,
+                    None,
+                    train=False,
+                    world_size=world_size,
+                )
 
         if is_main:
             row = {

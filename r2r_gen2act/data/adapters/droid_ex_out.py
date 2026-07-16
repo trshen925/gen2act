@@ -101,9 +101,13 @@ class DroidExOutDataset(OpenXDroidDataset):
             num_steps = int(meta["num_frames"])
             rec = EpisodeRecord(d.name, num_steps, video, video, d / metadata_name, split,
                                 extra={"extrinsics_path": str(ext_path)})
-            # camera_projection calibration + quality filters (inherited) read the assembled payload
+            # camera_projection calibration + quality filters (inherited) read the assembled payload.
+            # A bad extrinsics.json (missing exterior_1, ~2/35k) raises → skip that clip robustly.
             if self.proprioception_enabled and str(self.proprioception_cfg.get("source", "")) == "camera_projection":
-                payload = self._read_action_payload(rec)
+                try:
+                    payload = self._read_action_payload(rec)
+                except (ValueError, KeyError):
+                    continue
                 if not self._has_camera_projection_calibration(payload) or not self._camera_projection_quality_ok(payload):
                     continue
             episodes.append(rec)
@@ -125,7 +129,12 @@ class DroidExOutDataset(OpenXDroidDataset):
         with open(episode.extra["extrinsics_path"], "r", encoding="utf-8") as f:
             ext = json.load(f)
         episode_id = ext.get("episode_id", "")
-        cam = ext["cameras"]["exterior_1"]
+        cams = ext.get("cameras", {})
+        if "exterior_1" not in cams:
+            # A handful of clips (~2/35k) use raw serial keys instead of exterior_1/2 → skip them.
+            raise ValueError(f"extrinsics.json for {episode.episode_id} has no 'exterior_1' camera "
+                             f"(keys={list(cams.keys())})")
+        cam = cams["exterior_1"]
         serial = str(cam["serial"])
         extrinsic_6d = [float(v) for v in cam["cam2base_extrinsics_6d"]]
 

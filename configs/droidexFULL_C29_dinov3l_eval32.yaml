@@ -1,0 +1,7 @@
+_base_: droidexFULL_C29_dinov3l_c28base.yaml
+
+model:
+  flow_dit:
+    num_inference_steps: 32
+    num_eval_samples: 16
+

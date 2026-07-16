@@ -4,7 +4,20 @@ version = "0.1.0"
 description = "Robot-to-robot Gen2Act refactor for Franka/Open-X datasets"
 requires-python = ">=3.11"
 
-dependencies = ["torch", "torchvision", "numpy", "imageio"]
+dependencies = [
+  "torch",
+  "torchvision",
+  "timm>=1.0.27",
+  "huggingface-hub",
+  "numpy",
+  "scipy",
+  "imageio",
+  "imageio-ffmpeg",
+  "pillow",
+  "pyarrow",
+  "pyyaml",
+  "matplotlib",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
