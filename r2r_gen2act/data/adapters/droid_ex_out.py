@@ -29,6 +29,11 @@ _OBS_GRIP = "steps/observation/gripper_position"
 _IS_LAST = "steps/is_last"
 _IS_TERM = "steps/is_terminal"
 
+_CAMERA_KEY_BY_VIDEO = {
+    "exterior_image_1_left": "exterior_1",
+    "exterior_image_2_left": "exterior_2",
+}
+
 
 def _json_col(table, name: str) -> list:
     """Decode a parquet column whose cells may be JSON-string arrays."""
@@ -100,7 +105,10 @@ class DroidExOutDataset(OpenXDroidDataset):
                     continue
             num_steps = int(meta["num_frames"])
             rec = EpisodeRecord(d.name, num_steps, video, video, d / metadata_name, split,
-                                extra={"extrinsics_path": str(ext_path)})
+                                extra={
+                                    "extrinsics_path": str(ext_path),
+                                    "camera_name": str(meta.get("camera", "")),
+                                })
             # camera_projection calibration + quality filters (inherited) read the assembled payload.
             # A bad extrinsics.json (missing exterior_1, ~2/35k) raises → skip that clip robustly.
             if self.proprioception_enabled and str(self.proprioception_cfg.get("source", "")) == "camera_projection":
@@ -119,24 +127,53 @@ class DroidExOutDataset(OpenXDroidDataset):
         cached = self._payload_cache.get(episode.episode_id)
         if cached is not None:
             return cached
+        with open(episode.extra["extrinsics_path"], "r", encoding="utf-8") as f:
+            ext = json.load(f)
+        episode_id = ext.get("episode_id", "")
+        cams = ext.get("cameras", {})
+        selection = str(self.data_cfg.get("camera_selection", "legacy_exterior_1"))
+        camera_name = str(episode.extra.get("camera_name", ""))
+        if selection == "legacy_exterior_1":
+            camera_key = "exterior_1"
+        elif selection == "from_meta":
+            camera_key = _CAMERA_KEY_BY_VIDEO.get(camera_name, "")
+            if not camera_key:
+                raise ValueError(
+                    f"Unsupported meta.camera={camera_name!r} for clip {episode.episode_id}; "
+                    f"known values={sorted(_CAMERA_KEY_BY_VIDEO)}"
+                )
+        else:
+            raise ValueError(
+                f"Unknown data.camera_selection={selection!r}; expected "
+                "'legacy_exterior_1' or 'from_meta'"
+            )
+        if camera_key not in cams:
+            raise ValueError(
+                f"extrinsics.json for {episode.episode_id} has no {camera_key!r} camera "
+                f"selected from meta.camera={camera_name!r} (keys={list(cams.keys())})"
+            )
+        cam = cams[camera_key]
+        allowed_sources = self.data_cfg.get("allowed_camera_calibration_sources", [])
+        if isinstance(allowed_sources, str):
+            allowed_sources = [allowed_sources]
+        allowed_sources = {str(v) for v in (allowed_sources or [])}
+        calibration_source = str(cam.get("source", ""))
+        if allowed_sources and calibration_source not in allowed_sources:
+            raise ValueError(
+                f"Camera calibration source {calibration_source!r} for clip {episode.episode_id} "
+                f"is not in allowed_camera_calibration_sources={sorted(allowed_sources)}"
+            )
+        serial = str(cam["serial"])
+        extrinsic_6d = [float(v) for v in cam["cam2base_extrinsics_6d"]]
+
+        # Read the larger parquet only after camera/calibration validation, so rejected
+        # predicted calibrations do not add avoidable shared-filesystem I/O.
         meta_dir = episode.metadata_path.parent
         table = pq.read_table(str(meta_dir / "data.parquet"))
         cart = np.asarray(_json_col(table, _OBS_CART), dtype=np.float64)          # [T,6]
         grip = np.asarray(table.column(_OBS_GRIP).to_pylist(), dtype=np.float64).reshape(-1, 1)  # [T,1]
         is_last = [int(x) for x in table.column(_IS_LAST).to_pylist()] if _IS_LAST in table.column_names else [0] * len(cart)
         is_term = [int(x) for x in table.column(_IS_TERM).to_pylist()] if _IS_TERM in table.column_names else [0] * len(cart)
-
-        with open(episode.extra["extrinsics_path"], "r", encoding="utf-8") as f:
-            ext = json.load(f)
-        episode_id = ext.get("episode_id", "")
-        cams = ext.get("cameras", {})
-        if "exterior_1" not in cams:
-            # A handful of clips (~2/35k) use raw serial keys instead of exterior_1/2 → skip them.
-            raise ValueError(f"extrinsics.json for {episode.episode_id} has no 'exterior_1' camera "
-                             f"(keys={list(cams.keys())})")
-        cam = cams["exterior_1"]
-        serial = str(cam["serial"])
-        extrinsic_6d = [float(v) for v in cam["cam2base_extrinsics_6d"]]
 
         intr_ep = self._intrinsics().get(episode_id, {})
         intr = intr_ep.get(serial)
@@ -166,6 +203,11 @@ class DroidExOutDataset(OpenXDroidDataset):
             "is_last": is_last,
             "is_terminal": is_term,
             "_serial": serial,
+            "_camera_name": camera_name,
+            "_camera_key": camera_key,
+            "_camera_calibration_source": calibration_source,
+            "_camera_calibration_metric_type": str(cam.get("metric_type", "")),
+            "_camera_calibration_quality": cam.get("quality_metric"),
         }
         # keep cache small (dataloader workers each build their own)
         if len(self._payload_cache) < 256:

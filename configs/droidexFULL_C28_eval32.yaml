@@ -19,6 +19,7 @@ data:
   target_video_name: rgb.mp4
   metadata_name: meta.json
   frames_subdir: frames
+  camera_selection: legacy_exterior_1
   intrinsics_json: /mnt/pfs/data/shentingrui/KarlP-droid/intrinsics.json
   fps: 15
   dt_time_embed:
@@ -48,6 +49,7 @@ data:
     key: cartesian_position
     step: target
     dims: 3
+    projection_image_space: original
     append_progress: false
     projection_max_abs: 3.0
     projection_max_outside_frac: 0.05

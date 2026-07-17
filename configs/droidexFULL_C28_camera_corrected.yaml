@@ -1,0 +1,17 @@
+# Corrected C28 data semantics. This is intentionally a separate experiment:
+# legacy C28 checkpoints were trained with exterior_1 calibration for every clip.
+
+_base_: droidexFULL_C28_bigdit_scratch.yaml
+
+experiment:
+  name: droidexFULL_C28_camera_corrected
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidexFULL_C28_camera_corrected
+
+data:
+  max_episodes: 35696
+  camera_selection: from_meta
+  # Keep both GT and Pred calibrations. A stratified visual audit showed that
+  # most Pred calibrations align; provenance remains in each payload for audits.
+  allowed_camera_calibration_sources: []
+  proprioception:
+    projection_image_space: model_input

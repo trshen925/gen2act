@@ -108,8 +108,29 @@ class OpenXDroidDataset(WindowedRobotDataset):
         cy *= image_h / float(intr["height"])
         u = fx * points_camera[:, 0] / z + cx
         v = fy * points_camera[:, 1] / z + cy
-        norm = np.stack([2.0 * u / max(1.0, image_w - 1.0) - 1.0, 2.0 * v / max(1.0, image_h - 1.0) - 1.0], axis=1)
+        norm = self._normalize_projection_pixels(u, v, image_h, image_w, prop_cfg)
         return bool(np.mean(np.abs(norm) > max_abs) <= max_outside_frac)
+
+    def _normalize_projection_pixels(self, u, v, image_h: int, image_w: int, prop_cfg: dict) -> np.ndarray:
+        """Normalize projected pixels in either the raw frame or the model's cropped input space."""
+        uv = np.stack([np.asarray(u, dtype=np.float64), np.asarray(v, dtype=np.float64)], axis=-1)
+        space = str(prop_cfg.get("projection_image_space", "original"))
+        if space == "original":
+            out = uv.copy()
+            out[..., 0] = 2.0 * out[..., 0] / max(1.0, image_w - 1.0) - 1.0
+            out[..., 1] = 2.0 * out[..., 1] / max(1.0, image_h - 1.0) - 1.0
+            return out
+        if space == "model_input":
+            from r2r_gen2act.data.overlay import raw_to_display_px
+
+            shape = uv.shape
+            display = raw_to_display_px(uv.reshape(-1, 2), image_w, image_h, self.image_size).reshape(shape)
+            display[..., 0] = 2.0 * display[..., 0] / max(1.0, self.image_size - 1.0) - 1.0
+            display[..., 1] = 2.0 * display[..., 1] / max(1.0, self.image_size - 1.0) - 1.0
+            return display
+        raise ValueError(
+            f"Unknown proprioception.projection_image_space={space!r}; expected 'original' or 'model_input'"
+        )
 
     def _camera_serial(self, payload: dict, key: str = "") -> str:
         extrinsics = payload.get("calibration", {}).get("extrinsics", {})
@@ -147,10 +168,9 @@ class OpenXDroidDataset(WindowedRobotDataset):
         z = max(float(pos_camera[2]), 1e-6)
         u = fx * float(pos_camera[0]) / z + cx
         v = fy * float(pos_camera[1]) / z + cy
-        # Normalize pixel coordinates to [-1, 1] at image borders. Do not clamp: out-of-frame
-        # end-effector locations intentionally become values outside [-1, 1].
-        u_norm = (2.0 * u / max(1.0, image_w - 1.0)) - 1.0
-        v_norm = (2.0 * v / max(1.0, image_h - 1.0)) - 1.0
+        # Do not clamp: out-of-frame end-effector locations intentionally remain outside [-1, 1].
+        uv_norm = self._normalize_projection_pixels(u, v, image_h, image_w, prop_cfg)
+        u_norm, v_norm = float(uv_norm[0]), float(uv_norm[1])
         if int(prop_cfg.get("dims", 2)) >= 3:
             return np.asarray([u_norm, v_norm, float(pos_camera[2])], dtype=np.float32)[: int(prop_cfg.get("dims", 2))]
         return np.asarray([u_norm, v_norm], dtype=np.float32)
@@ -245,13 +265,20 @@ class OpenXDroidDataset(WindowedRobotDataset):
             positions = payload["observations"]["cartesian_position"]
             n = min(int(episode.num_steps), len(positions))
             pts = []
+            projection_space = str(prop_cfg.get("projection_image_space", "original"))
             for step in range(n):
                 uv = self._project_ee_to_normalized_image(payload, step, prop_cfg)
-                u_px = (float(uv[0]) + 1.0) / 2.0 * (w - 1.0)
-                v_px = (float(uv[1]) + 1.0) / 2.0 * (h - 1.0)
+                if projection_space == "model_input":
+                    u_px = (float(uv[0]) + 1.0) / 2.0 * (self.image_size - 1.0)
+                    v_px = (float(uv[1]) + 1.0) / 2.0 * (self.image_size - 1.0)
+                else:
+                    u_px = (float(uv[0]) + 1.0) / 2.0 * (w - 1.0)
+                    v_px = (float(uv[1]) + 1.0) / 2.0 * (h - 1.0)
                 pts.append([u_px, v_px])
             if len(pts) < 2:
                 return None
+            if projection_space == "model_input":
+                return np.asarray(pts, dtype=np.float32), self.image_size, self.image_size
             return np.asarray(pts, dtype=np.float32), w, h
         except Exception:
             return None

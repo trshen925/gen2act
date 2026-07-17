@@ -1,0 +1,24 @@
+# Adapt the current best C30 total-epoch-24 checkpoint to corrected camera
+# semantics. This is a weights-only warm restart because video-camera selection,
+# proprioception coordinates, action coordinates, and aux targets all change.
+
+_base_: droidexFULL_C30_camera_corrected_scratch.yaml
+
+experiment:
+  name: droidexFULL_C30_camera_corrected_cont12_lr3e5
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidexFULL_C30_camera_corrected_cont12_lr3e5
+
+train:
+  resume_checkpoint: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidexFULL_C30_cont12_lr3e5/latest.pt
+  epochs: 12
+  optimizer:
+    name: adamw
+    lr: 0.00003
+    backbone_lr_multiplier: 0.3
+    llrd: 0.7
+    weight_decay: 0.05
+    betas: [0.9, 0.95]
+  scheduler:
+    name: cosine
+    warmup_ratio: 0.05
+    min_lr_ratio: 0.05

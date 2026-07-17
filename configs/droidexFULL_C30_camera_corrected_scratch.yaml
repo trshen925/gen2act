@@ -1,0 +1,15 @@
+# Base corrected-data C30 architecture. This file is the from-scratch variant;
+# the separate camera_corrected_cont12 config inherits it and adapts legacy C30 weights.
+
+_base_: droidexFULL_C30_dit16_mixer8_c28base.yaml
+
+experiment:
+  name: droidexFULL_C30_camera_corrected_scratch
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidexFULL_C30_camera_corrected_scratch
+
+data:
+  max_episodes: 35696
+  camera_selection: from_meta
+  allowed_camera_calibration_sources: []
+  proprioception:
+    projection_image_space: model_input
