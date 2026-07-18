@@ -54,7 +54,7 @@ def main() -> None:
     normalize = bool(cfg.get("action", {}).get("regression_normalize", False)) or str(cfg["action"]["mode"]) == "flow"
     eff = int(cfg["data"]["future_horizon"]) * int(cfg["action"]["chunk_size"])
 
-    keys = ["source_video", "target_history", "proprioception", "point_track", "point_track_causal"]
+    keys = ["source_video", "target_history", "wrist_current", "proprioception", "point_track", "point_track_causal"]
     eps = ds.episodes[: args.max_episodes]
 
     # first pass: collect GT +5 deltas to compute the global mean-delta baseline
@@ -71,6 +71,8 @@ def main() -> None:
                 if k in samples[0] and torch.is_tensor(samples[0][k]):
                     batch[k] = torch.stack([s[k] for s in samples]).to(device)
             kw = {"point_track_causal": batch["point_track_causal"]} if "point_track_causal" in batch else {}
+            if "wrist_current" in batch:
+                kw["wrist_current"] = batch["wrist_current"]
             out = model(batch["source_video"], batch["target_history"], batch.get("proprioception"), None,
                         batch.get("point_track"), **kw)
             pred = out["action_pred"]

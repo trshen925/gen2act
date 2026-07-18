@@ -71,6 +71,9 @@ def main() -> None:
             pt = pt.to(device) if torch.is_tensor(pt) else None
             ptc = batch.get("point_track_causal")
             kw = {"point_track_causal": ptc.to(device)} if torch.is_tensor(ptc) else {}
+            wrist = batch.get("wrist_current")
+            if torch.is_tensor(wrist):
+                kw["wrist_current"] = wrist.to(device)
             out = model(src, tgt_h, prop, None, pt, **kw)
             p = out["action_pred"]
             if normalize:

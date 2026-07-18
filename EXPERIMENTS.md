@@ -1236,3 +1236,24 @@ XYZ MAE **1.855→1.672 cm（-9.9%）**，dx/dy corr 微升。ODE 积分更细 +
   2. 但当前 latest 仍略差于 C28 ep17 的1.703cm（+3.6%），尚未证明 DiT16/mixer8 胜出。
   3. 早期64-window快速诊断曾得到 ep4 best=1.444cm、ep6 latest=1.539cm，但该结果使用16 steps/8 samples且只测64 windows，**不能与800-window 32/16正式结果直接比较**。
   4. 原始 ep7 best 的800-window 32/16正式评估尚未完成；必须补测，因为 flow 的 val-loss best/latest 关系不稳定。低LR续训也只完成5/12 epoch。
+
+## Exp C31 — corrected C30 + 当前腕部 RGB  ✅ 12 epoch完成，正式结果与C30持平
+
+- **目的**: 验证近距离腕部视角能否降低夹取阶段几厘米位置误差。以 corrected C30 为唯一基线，保留8帧外部demo、当前外部RGB和EE状态，只新增与当前时刻同步的腕部RGB；不加入深度或未来腕部帧。
+- **结构**: 当前外部帧和腕部帧共享同一个DINOv2-B、同一组32个readout query及最后3层query注入，仅增加独立视角类型向量 `type_wrist_current`（768参数），没有复制视觉backbone。
+- **数据**: 仍冻结 `max_episodes=35696` 及原train/val划分。腕部原视频来自DROID `steps_observation_wrist_image_left.mp4`，按每个clip的 `source_frame_range=[f0,f1)` 离线截取为 `wrist_frames/<clip_relative_idx>.jpg`。已完成35696/35696 clip、5,028,323帧，零错误。
+- **初始化/训练**: 从 corrected C30 ep11 checkpoint做weights-only warm restart；旧权重全部精确加载，仅新增 `type_wrist_current` 随机初始化。DiT16/mixer8不变，训练12 epoch，主LR `3e-5`。
+- **配置与入口**: `configs/droidexFULL_C31_wrist_current_cont12_lr3e5.yaml`；训练 `bash scripts/run_train_c31_wrist.sh`；正式32-step/16-sample诊断 `bash scripts/run_eval_c31_wrist.sh <checkpoint>`。
+- **实施验证**: 07970的首/中/末缓存帧与原视频 `f0+idx` 对齐（JPEG MAE 1.60–1.81/255）；dataset单样本 `[3,224,224]`、batch `[B,3,224,224]`；真实C30权重加载仅缺新增类型向量；完整loss前反向后所有431M可训练参数均有梯度。
+- **训练完成**: 12 epoch全部完成；`latest.pt`=ep12，训练内置XYZ MAE约1.660cm。`best.pt`=ep6，但它按包含gripper/terminate的总val loss选择，不代表位置指标最优。
+- **正式诊断**: 为消除flow随机采样噪声，给`diagnose_actions.py`增加固定seed，并用相同seed=0在冻结val前800 windows、32 ODE steps/16 samples下重跑corrected C30 ep11和C31 ep12 latest：
+
+  | 指标 | corrected C30 ep11 | C31 wrist ep12 | C31-C30 |
+  |---|---:|---:|---:|
+  | XYZ MAE | **1.583 cm** | **1.582 cm** | -0.001 cm（实际持平） |
+  | dx MAE | 1.502 cm | **1.485 cm** | -0.017 cm |
+  | dy MAE | 1.555 cm | **1.547 cm** | -0.008 cm |
+  | dz MAE | **1.691 cm** | 1.716 cm | +0.025 cm |
+  | dx/dy/dz corr | .918/.937/.938 | .923/.936/.938 | dx略升，其余持平 |
+
+- **结论**: 单独加入当前腕部RGB没有降低总体XYZ误差；它对x/y有毫米级改善，但被z方向约0.25mm退化抵消。当前离线全窗口平均指标不支持“腕部RGB整体更好”，但也不能排除它只在夹取附近、遮挡或近距离子集有效，下一步应按gripper闭合前后的窗口做分段评估。

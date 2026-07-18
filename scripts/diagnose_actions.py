@@ -10,6 +10,7 @@ in RAW units (cm for xyz). Mirrors the metrics used in EXPERIMENTS.md.
 from __future__ import annotations
 
 import argparse
+import random
 import sys
 from pathlib import Path
 
@@ -35,7 +36,14 @@ def main() -> None:
     ap.add_argument("--max-windows", type=int, default=800)
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     cfg = load_config(args.config)
     device = torch.device(args.device)
@@ -69,6 +77,9 @@ def main() -> None:
             sdt = batch.get("source_dt")
             if torch.is_tensor(sdt):
                 kw["source_dt"] = sdt.to(device)
+            wrist = batch.get("wrist_current")
+            if torch.is_tensor(wrist):
+                kw["wrist_current"] = wrist.to(device)
             out = model(src, tgt_h, prop, None, point_track, **kw)
             pred = out["action_pred"]
             if normalize:

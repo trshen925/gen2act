@@ -97,6 +97,11 @@ class WindowedRobotDataset(Dataset):
         # randomly seeking the mp4 (see scripts/extract_frames.py). Much faster; empty = use mp4.
         self.frames_subdir = str(self.data_cfg.get("frames_subdir", "") or "")
         self.frames_ext = str(self.data_cfg.get("frames_ext", "jpg"))
+        wrist_cfg = self.data_cfg.get("wrist_current", {}) or {}
+        self.wrist_current_enabled = bool(wrist_cfg.get("enabled", False))
+        self.wrist_frames_subdir = str(wrist_cfg.get("frames_subdir", "wrist_frames"))
+        self.wrist_frames_ext = str(wrist_cfg.get("frames_ext", "jpg"))
+        self.wrist_allow_video_fallback = bool(wrist_cfg.get("allow_video_fallback", False))
         self._frame_count_cache: dict[Path, int] = {}
         self.window_jitter_cfg = self.data_cfg.get("window_jitter", {})
         # C11: depth 3D lifting — load per-frame depth alongside RGB frames.
@@ -417,6 +422,21 @@ class WindowedRobotDataset(Dataset):
             raise ValueError(f"Episode {episode.episode_id} has no target video")
         return self._read_video_indices(episode.target_video_path, list(range(start_index, start_index + self.target_history_len)))
 
+    def _read_wrist_current(self, episode: EpisodeRecord, target_step: int) -> torch.Tensor:
+        """Read the wrist frame synchronized with the external current observation."""
+        cache_dir = Path(episode.metadata_path).parent / self.wrist_frames_subdir
+        cached = cache_dir / f"{int(target_step):06d}.{self.wrist_frames_ext}"
+        if cached.exists():
+            return image_to_tensor(imageio.imread(str(cached)), self.image_size)
+        if not self.wrist_allow_video_fallback:
+            raise FileNotFoundError(
+                f"Missing wrist cache frame {cached}; run scripts/preprocess_wrist_frames.py first")
+        wrist_video = Path(str(episode.extra.get("wrist_video_path", "")))
+        if not wrist_video.exists():
+            raise FileNotFoundError(f"Missing raw wrist video for {episode.episode_id}: {wrist_video}")
+        raw_idx = int(episode.extra.get("source_frame_start", 0)) + int(target_step)
+        return self._read_video_indices(wrist_video, [raw_idx])[0]
+
     def _jitter_start_index(self, episode: EpisodeRecord, start_index: int) -> int:
         if self.split != "train" or not bool(self.window_jitter_cfg.get("enabled", False)):
             return start_index
@@ -495,6 +515,12 @@ class WindowedRobotDataset(Dataset):
                     source_video = apply_structural_augmentation(source_video, self.struct_aug_cfg, ee_fracs)
             sample["source_video"] = source_video
             sample["target_history"] = target_history
+            if self.wrist_current_enabled:
+                wrist_current = self._read_wrist_current(episode, target_step)
+                if self.split == "train":
+                    wrist_current = apply_image_augmentation(
+                        wrist_current.unsqueeze(0), self.augmentation_cfg)[0]
+                sample["wrist_current"] = wrist_current
             if self.overlay_enabled:
                 # draw the demo EE path onto the current (last) frame AFTER augmentation (crisp path)
                 target_history[-1] = self._overlay_current_frame(target_history[-1], episode.episode_id, target_step)

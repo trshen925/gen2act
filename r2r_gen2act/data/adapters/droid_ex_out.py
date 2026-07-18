@@ -50,6 +50,11 @@ class DroidExOutDataset(OpenXDroidDataset):
             "intrinsics_json", "/mnt/pfs/data/shentingrui/KarlP-droid/intrinsics.json"))
         self._intrinsics_all: dict | None = None
         self._payload_cache: dict[str, dict] = {}
+        wrist_cfg = cfg["data"].get("wrist_current", {}) or {}
+        self._wrist_raw_root = Path(str(wrist_cfg.get(
+            "raw_root", "/mnt/pfs/data/fenghaoran/droid/decompressed/1.0.1")))
+        self._wrist_video_name = str(wrist_cfg.get(
+            "video_name", "steps_observation_wrist_image_left.mp4"))
         super().__init__(cfg, split=split)
 
     # ── intrinsics loaded lazily & cached (125 MB json, load once) ──────────
@@ -104,10 +109,17 @@ class DroidExOutDataset(OpenXDroidDataset):
                 if not fdir.is_dir() or not any(fdir.iterdir()):
                     continue
             num_steps = int(meta["num_frames"])
+            raw_episode_id = str(meta.get("episode_id", ""))
+            wrist_video = self._wrist_raw_root / raw_episode_id / self._wrist_video_name
+            source_range = meta.get("source_frame_range", [0, num_steps])
+            if self.wrist_current_enabled and not wrist_video.exists():
+                continue
             rec = EpisodeRecord(d.name, num_steps, video, video, d / metadata_name, split,
                                 extra={
                                     "extrinsics_path": str(ext_path),
                                     "camera_name": str(meta.get("camera", "")),
+                                    "source_frame_start": int(source_range[0]),
+                                    "wrist_video_path": str(wrist_video),
                                 })
             # camera_projection calibration + quality filters (inherited) read the assembled payload.
             # A bad extrinsics.json (missing exterior_1, ~2/35k) raises → skip that clip robustly.

@@ -1,0 +1,32 @@
+# C31: corrected C30 plus one synchronized current wrist RGB observation.
+# The wrist and external current frames share the DINOv2/readout weights; only
+# their type embeddings differ. This is a weights-only warm restart from C30 ep11.
+_base_: droidexFULL_C30_camera_corrected_cont12_lr3e5.yaml
+
+experiment:
+  name: droidexFULL_C31_wrist_current_cont12_lr3e5
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidexFULL_C31_wrist_current_cont12_lr3e5
+
+data:
+  wrist_current:
+    enabled: true
+    raw_root: /mnt/pfs/data/fenghaoran/droid/decompressed/1.0.1
+    video_name: steps_observation_wrist_image_left.mp4
+    frames_subdir: wrist_frames
+    frames_ext: jpg
+    allow_video_fallback: false
+
+model:
+  wrist_current:
+    enabled: true
+
+train:
+  resume_checkpoint: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidexFULL_C30_camera_corrected_cont12_lr3e5/c30_camera_corrected_ep11.pt
+  epochs: 12
+  optimizer:
+    name: adamw
+    lr: 0.00003
+    backbone_lr_multiplier: 0.3
+    llrd: 0.7
+    weight_decay: 0.05
+    betas: [0.9, 0.95]

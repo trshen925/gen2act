@@ -249,6 +249,9 @@ def run_epoch(model, loader, codec, cfg, device, optimizer=None, train: bool = T
                 sdt = batch.get("source_dt")
                 if sdt is not None:
                     extra["source_dt"] = sdt.to(device)
+                wrist = batch.get("wrist_current")
+                if wrist is not None:
+                    extra["wrist_current"] = wrist
                 outputs = model(batch.get("source_video"), batch.get("target_history"), proprioception, action_target, point_track, **extra)
                 losses = compute_losses(outputs, batch, codec, cfg)
                 if not torch.isfinite(losses["loss"]):

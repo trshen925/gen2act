@@ -26,7 +26,7 @@ class FusedQueryFlowPolicy(nn.Module):
                  point_encoder_causal=None, aux_traj_cfg: dict | None = None,
                  aux_progress_cfg: dict | None = None, dt_time_cfg: dict | None = None,
                  current_full_patch: bool = False, max_source_len: int | None = None,
-                 pad_source: bool = False) -> None:
+                 pad_source: bool = False, wrist_current_enabled: bool = False) -> None:
         super().__init__()
         # C21: current obs uses all 256 DINOv2 patch tokens (no readout compression) — the current
         # frame is the most action-relevant input, full patches preserve spatial detail.
@@ -50,6 +50,9 @@ class FusedQueryFlowPolicy(nn.Module):
         # type embeddings so the flow head's VL mixer can tell the conditioning sources apart
         self.type_source = nn.Parameter(torch.randn(1, 1, dim) / dim**0.5)
         self.type_current = nn.Parameter(torch.randn(1, 1, dim) / dim**0.5)
+        self.wrist_current_enabled = bool(wrist_current_enabled)
+        if self.wrist_current_enabled:
+            self.type_wrist_current = nn.Parameter(torch.randn(1, 1, dim) / dim**0.5)
         # Keep the state-dict key for checkpoint compatibility, but do not ask
         # DDP to reduce a parameter for a condition stream that is disabled.
         self.type_point = nn.Parameter(
@@ -139,23 +142,32 @@ class FusedQueryFlowPolicy(nn.Module):
         q_out = q_out + stream.unsqueeze(0)
         return q_out.reshape(b, n * self.num_queries, -1)
 
-    def _encode_current_full(self, frame: torch.Tensor) -> torch.Tensor:
+    def _encode_current_full(self, frame: torch.Tensor, stream: torch.Tensor | None = None) -> torch.Tensor:
         """Encode current obs frame as all 256 DINOv2 patch tokens (no readout-query injection).
         Returns [B, 256, dim] with type_current added."""
         x = (frame - self.image_mean) / self.image_std
         x, context = self.vit.prepare_tokens(x)
         x = self.vit.run_blocks(x, context=context)
         x = self.vit.normalize_tokens(x)
-        return self.vit.patch_tokens(x) + self.type_current
+        return self.vit.patch_tokens(x) + (self.type_current if stream is None else stream)
 
     def _build_cond(self, source_video, current_frame, point_track, ee, point_track_causal=None,
-                    source_dt=None) -> torch.Tensor:
+                    source_dt=None, wrist_current=None) -> torch.Tensor:
         if self.current_full_patch:
             cur = self._encode_current_full(current_frame)                       # [B, 256, dim]
         else:
             cur = self._readout(current_frame.unsqueeze(1), None, self.type_current)  # [B, 32, dim]
         pad_to = self.max_source_len if self.pad_source else None
         groups = [self._readout(source_video, self.source_time_embed, self.type_source, source_dt, pad_to), cur]
+        if self.wrist_current_enabled:
+            if wrist_current is None:
+                raise ValueError("wrist_current is required when model.wrist_current.enabled=true")
+            if self.current_full_patch:
+                wrist = self._encode_current_full(wrist_current, self.type_wrist_current)
+            else:
+                wrist = self._readout(
+                    wrist_current.unsqueeze(1), None, self.type_wrist_current)
+            groups.append(wrist)
         if self.point_encoder is not None and point_track is not None:   # C7-flow has no point tracks
             groups.append(self.point_encoder(point_track) + self.type_point)
         if self.point_encoder_causal is not None and point_track_causal is not None:
@@ -174,12 +186,12 @@ class FusedQueryFlowPolicy(nn.Module):
         return torch.tanh(self.aux_traj_head(self.aux_traj_norm(src)))
 
     def forward(self, source_video, target_history=None, proprioception=None, action_target=None,
-                point_track=None, point_track_causal=None, source_dt=None):
+                point_track=None, point_track_causal=None, source_dt=None, wrist_current=None):
         if target_history is None or proprioception is None:
             raise ValueError("FusedQueryFlowPolicy needs source_video, target_history, proprioception(EE)")
         k_src = int(source_video.shape[1])   # runtime source frame count (dynamic under C24)
         cond = self._build_cond(source_video, target_history[:, -1], point_track, proprioception,
-                                point_track_causal, source_dt)
+                                point_track_causal, source_dt, wrist_current)
         if self.training:
             if action_target is None:
                 raise ValueError("flow_dit head requires action_target during training")
