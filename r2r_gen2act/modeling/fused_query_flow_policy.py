@@ -26,7 +26,9 @@ class FusedQueryFlowPolicy(nn.Module):
                  point_encoder_causal=None, aux_traj_cfg: dict | None = None,
                  aux_progress_cfg: dict | None = None, dt_time_cfg: dict | None = None,
                  current_full_patch: bool = False, max_source_len: int | None = None,
-                 pad_source: bool = False, wrist_current_enabled: bool = False) -> None:
+                 pad_source: bool = False, wrist_current_enabled: bool = False,
+                 separate_stream_queries: bool = False,
+                 front_depth_cfg: dict | None = None) -> None:
         super().__init__()
         # C21: current obs uses all 256 DINOv2 patch tokens (no readout compression) — the current
         # frame is the most action-relevant input, full patches preserve spatial detail.
@@ -45,7 +47,14 @@ class FusedQueryFlowPolicy(nn.Module):
         dim = vit.hidden_dim
         n_blocks = len(self.vit.backend.blocks)
         self.segmenter_start = int(segmenter_start) % n_blocks if segmenter_start >= 0 else n_blocks + int(segmenter_start)
+        # ``query`` retains the historical checkpoint key and is the source-video
+        # readout. Optional stream-specific queries are warm-started from it.
         self.query = nn.Parameter(torch.randn(self.num_queries, dim) / dim**0.5)
+        self.separate_stream_queries = bool(separate_stream_queries)
+        if self.separate_stream_queries:
+            self.query_current = nn.Parameter(self.query.detach().clone())
+            if wrist_current_enabled:
+                self.query_wrist = nn.Parameter(self.query.detach().clone())
         self.source_time_embed = nn.Parameter(torch.randn(self.max_source_len, 1, dim) / dim**0.5)
         # type embeddings so the flow head's VL mixer can tell the conditioning sources apart
         self.type_source = nn.Parameter(torch.randn(1, 1, dim) / dim**0.5)
@@ -69,6 +78,18 @@ class FusedQueryFlowPolicy(nn.Module):
         std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
         self.register_buffer("image_mean", mean, persistent=False)
         self.register_buffer("image_std", std, persistent=False)
+        front_depth_cfg = front_depth_cfg or {}
+        self.front_depth_enabled = bool(front_depth_cfg.get("enabled", False))
+        if self.front_depth_enabled:
+            geometry_dim = int(front_depth_cfg.get("geometry_dim", 4))
+            if geometry_dim != 4:
+                raise ValueError("front depth geometry must contain [X,Y,Z,valid_ratio] (geometry_dim=4)")
+            self.front_geometry_encoder = nn.Sequential(
+                nn.Linear(geometry_dim, dim), nn.GELU(), nn.Linear(dim, dim))
+            # Begin exactly at the RGB checkpoint behaviour; gradients immediately
+            # make the geometry branch trainable without perturbing step zero.
+            nn.init.zeros_(self.front_geometry_encoder[-1].weight)
+            nn.init.zeros_(self.front_geometry_encoder[-1].bias)
         # C17: auxiliary source-video abs-EE-pose head (same regularizer as C15v2, applied to flow policy).
         # source tokens are always first in the cond sequence: [B, source_len*num_queries, dim].
         aux_traj_cfg = aux_traj_cfg or {}
@@ -112,13 +133,44 @@ class FusedQueryFlowPolicy(nn.Module):
         feat = torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)              # [B,T,2F]
         return self.dt_mlp(feat)                                                 # [B,T,dim]
 
+    def checkpoint_state_dict_compat(self, state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Expand an old shared-readout checkpoint into stream-specific queries."""
+        if not self.separate_stream_queries or "query" not in state:
+            return state
+        upgraded = dict(state)
+        upgraded.setdefault("query_current", state["query"].clone())
+        if hasattr(self, "query_wrist"):
+            upgraded.setdefault("query_wrist", state["query"].clone())
+        return upgraded
+
+    def _stream_query(self, stream_name: str) -> torch.Tensor:
+        if not self.separate_stream_queries or stream_name == "source":
+            return self.query
+        if stream_name == "current":
+            return self.query_current
+        if stream_name == "wrist" and hasattr(self, "query_wrist"):
+            return self.query_wrist
+        raise ValueError(f"Unknown or disabled readout stream: {stream_name}")
+
     def _readout(self, video: torch.Tensor, time_embed, stream: torch.Tensor,
-                 dt_sec: torch.Tensor | None = None, pad_to: int | None = None) -> torch.Tensor:
+                 dt_sec: torch.Tensor | None = None, pad_to: int | None = None,
+                 stream_name: str = "source",
+                 patch_geometry: torch.Tensor | None = None) -> torch.Tensor:
         b, t, c, h, w = video.shape
         x = ((video - self.image_mean) / self.image_std).reshape(b * t, c, h, w)
         x, context = self.vit.prepare_tokens(x)
         x = self.vit.run_blocks(x, end=self.segmenter_start, context=context)
-        q = self.query[None].expand(b * t, -1, -1)
+        if patch_geometry is not None:
+            geometry = patch_geometry.reshape(b * t, patch_geometry.shape[-2], patch_geometry.shape[-1])
+            prefix = int(getattr(self.vit.backend, "num_prefix_tokens", 1))
+            patches = x[:, prefix:]
+            if geometry.shape[1] != patches.shape[1]:
+                raise ValueError(
+                    f"Front geometry has {geometry.shape[1]} patches, DINO has {patches.shape[1]}")
+            valid = (geometry[..., 3:4] > 0).to(patches.dtype)
+            patches = patches + self.front_geometry_encoder(geometry.to(patches.dtype)) * valid
+            x = torch.cat((x[:, :prefix], patches), dim=1)
+        q = self._stream_query(stream_name)[None].expand(b * t, -1, -1)
         x = torch.cat([q, x], dim=1)
         x = self.vit.run_blocks(
             x,
@@ -152,13 +204,21 @@ class FusedQueryFlowPolicy(nn.Module):
         return self.vit.patch_tokens(x) + (self.type_current if stream is None else stream)
 
     def _build_cond(self, source_video, current_frame, point_track, ee, point_track_causal=None,
-                    source_dt=None, wrist_current=None) -> torch.Tensor:
+                    source_dt=None, wrist_current=None, front_geometry=None) -> torch.Tensor:
         if self.current_full_patch:
+            if self.front_depth_enabled:
+                raise ValueError("front depth fusion requires current_full_patch=false")
             cur = self._encode_current_full(current_frame)                       # [B, 256, dim]
         else:
-            cur = self._readout(current_frame.unsqueeze(1), None, self.type_current)  # [B, 32, dim]
+            if self.front_depth_enabled and front_geometry is None:
+                raise ValueError("front_geometry is required when front depth is enabled")
+            cur = self._readout(
+                current_frame.unsqueeze(1), None, self.type_current,
+                stream_name="current", patch_geometry=front_geometry)           # [B, 32, dim]
         pad_to = self.max_source_len if self.pad_source else None
-        groups = [self._readout(source_video, self.source_time_embed, self.type_source, source_dt, pad_to), cur]
+        groups = [self._readout(
+            source_video, self.source_time_embed, self.type_source, source_dt, pad_to,
+            stream_name="source"), cur]
         if self.wrist_current_enabled:
             if wrist_current is None:
                 raise ValueError("wrist_current is required when model.wrist_current.enabled=true")
@@ -166,7 +226,8 @@ class FusedQueryFlowPolicy(nn.Module):
                 wrist = self._encode_current_full(wrist_current, self.type_wrist_current)
             else:
                 wrist = self._readout(
-                    wrist_current.unsqueeze(1), None, self.type_wrist_current)
+                    wrist_current.unsqueeze(1), None, self.type_wrist_current,
+                    stream_name="wrist")
             groups.append(wrist)
         if self.point_encoder is not None and point_track is not None:   # C7-flow has no point tracks
             groups.append(self.point_encoder(point_track) + self.type_point)
@@ -186,12 +247,13 @@ class FusedQueryFlowPolicy(nn.Module):
         return torch.tanh(self.aux_traj_head(self.aux_traj_norm(src)))
 
     def forward(self, source_video, target_history=None, proprioception=None, action_target=None,
-                point_track=None, point_track_causal=None, source_dt=None, wrist_current=None):
+                point_track=None, point_track_causal=None, source_dt=None, wrist_current=None,
+                front_geometry=None):
         if target_history is None or proprioception is None:
             raise ValueError("FusedQueryFlowPolicy needs source_video, target_history, proprioception(EE)")
         k_src = int(source_video.shape[1])   # runtime source frame count (dynamic under C24)
         cond = self._build_cond(source_video, target_history[:, -1], point_track, proprioception,
-                                point_track_causal, source_dt, wrist_current)
+                                point_track_causal, source_dt, wrist_current, front_geometry)
         if self.training:
             if action_target is None:
                 raise ValueError("flow_dit head requires action_target during training")

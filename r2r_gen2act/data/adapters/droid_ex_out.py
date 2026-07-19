@@ -18,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
+import torch
 
 from r2r_gen2act.data.adapters.openx_droid import OpenXDroidDataset
 from r2r_gen2act.data.split import split_episode_ids
@@ -55,6 +56,11 @@ class DroidExOutDataset(OpenXDroidDataset):
             "raw_root", "/mnt/pfs/data/fenghaoran/droid/decompressed/1.0.1")))
         self._wrist_video_name = str(wrist_cfg.get(
             "video_name", "steps_observation_wrist_image_left.mp4"))
+        depth_cfg = cfg["data"].get("depth", {}) or {}
+        self._front_geometry_root = Path(str(depth_cfg.get(
+            "root", "/mnt/pfs/data/shentingrui/droid-ex-3000-foundation-depth")))
+        self._front_geometry_name = str(depth_cfg.get(
+            "geometry_name", "patch_geometry_v1.npy"))
         super().__init__(cfg, split=split)
 
     # ── intrinsics loaded lazily & cached (125 MB json, load once) ──────────
@@ -225,3 +231,22 @@ class DroidExOutDataset(OpenXDroidDataset):
         if len(self._payload_cache) < 256:
             self._payload_cache[episode.episode_id] = payload
         return payload
+
+    def _read_front_geometry_at(
+        self, episode: EpisodeRecord, indices: list[int]
+    ) -> torch.Tensor | None:
+        """Random-access current-frame geometry without decompressing full depth videos."""
+        path = self._front_geometry_root / episode.episode_id / self._front_geometry_name
+        if not path.exists():
+            return torch.zeros(len(indices), self.depth_num_patches, 4, dtype=torch.float32)
+        try:
+            geometry = np.load(path, mmap_mode="r")
+            if geometry.ndim != 3 or geometry.shape[1:] != (self.depth_num_patches, 4):
+                raise ValueError(f"unexpected geometry shape {geometry.shape}")
+            selected = np.stack([
+                np.asarray(geometry[int(np.clip(i, 0, len(geometry) - 1))], dtype=np.float32)
+                for i in indices
+            ])
+            return torch.from_numpy(selected)
+        except (OSError, ValueError, IndexError):
+            return torch.zeros(len(indices), self.depth_num_patches, 4, dtype=torch.float32)

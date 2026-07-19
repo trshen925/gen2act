@@ -74,11 +74,19 @@ def main() -> None:
             ptc = ptc.to(device) if torch.is_tensor(ptc) else None
             wrist = batch.get("wrist_current")
             wrist = wrist.to(device) if torch.is_tensor(wrist) else None
+            source_dt = batch.get("source_dt")
+            source_dt = source_dt.to(device) if torch.is_tensor(source_dt) else None
+            front_geometry = batch.get("front_geometry")
+            front_geometry = front_geometry.to(device) if torch.is_tensor(front_geometry) else None
 
-            def run(src_, tgt_, prop_, pt_, ptc_):
+            def run(src_, tgt_, prop_, pt_, ptc_, geometry_=front_geometry):
                 kw = {"point_track_causal": ptc_} if ptc_ is not None else {}
                 if wrist is not None:
                     kw["wrist_current"] = wrist
+                if source_dt is not None:
+                    kw["source_dt"] = source_dt
+                if geometry_ is not None:
+                    kw["front_geometry"] = geometry_
                 out = model(src_, tgt_, prop_, None, pt_, **kw)
                 p = out["action_pred"]
                 if normalize:
@@ -87,7 +95,9 @@ def main() -> None:
 
             preds["intact"].append(run(src, tgt_h, prop, pt, ptc))
             preds["perm_source_video"].append(run(roll(src), tgt_h, prop, pt, ptc))
-            preds["perm_current_frame"].append(run(src, roll(tgt_h), prop, pt, ptc))
+            preds["perm_current_frame"].append(run(
+                src, roll(tgt_h), prop, pt, ptc,
+                roll(front_geometry) if front_geometry is not None else None))
             preds["perm_global_track"].append(run(src, tgt_h, prop, roll(pt), ptc))
             preds["perm_ee_progress"].append(run(src, tgt_h, roll(prop) if prop is not None else None, pt, ptc))
             if has_causal:

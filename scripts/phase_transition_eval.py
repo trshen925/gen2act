@@ -58,7 +58,7 @@ def main() -> None:
     normalize = bool(cfg.get("action", {}).get("regression_normalize", False)) or str(cfg["action"]["mode"]) == "flow"
     stride = int(cfg["data"]["future_horizon"])
     eff = stride * int(cfg["action"]["chunk_size"])
-    keys = ["source_video", "target_history", "wrist_current", "proprioception", "point_track", "point_track_causal"]
+    keys = ["source_video", "target_history", "wrist_current", "front_geometry", "proprioception", "point_track", "point_track_causal"]
 
     m_pred, mom_pred, gt, is_trans = [], [], [], []
     with torch.no_grad():
@@ -72,6 +72,8 @@ def main() -> None:
             kw = {"point_track_causal": batch["point_track_causal"]} if "point_track_causal" in batch else {}
             if "wrist_current" in batch:
                 kw["wrist_current"] = batch["wrist_current"]
+            if "front_geometry" in batch:
+                kw["front_geometry"] = batch["front_geometry"]
             out = model(batch["source_video"], batch["target_history"], batch.get("proprioception"), None,
                         batch.get("point_track"), **kw)
             pred = out["action_pred"]

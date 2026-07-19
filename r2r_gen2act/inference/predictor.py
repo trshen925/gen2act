@@ -55,6 +55,12 @@ class PolicyPredictor:
             if wrist.dim() == 3:
                 wrist = wrist.unsqueeze(0)
             extra["wrist_current"] = wrist
+        front_geometry = batch.get("front_geometry")
+        if torch.is_tensor(front_geometry):
+            front_geometry = front_geometry.to(self.device)
+            if front_geometry.dim() == 3:
+                front_geometry = front_geometry.unsqueeze(0)
+            extra["front_geometry"] = front_geometry
         outputs = self.model(source, target, proprioception, None, point_track, **extra)
         if "action_pred" in outputs:
             pred = outputs["action_pred"]

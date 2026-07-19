@@ -245,6 +245,9 @@ def run_epoch(model, loader, codec, cfg, device, optimizer=None, train: bool = T
                 ck = batch.get("camera_K")
                 if ck is not None:
                     extra["camera_K"] = ck
+                front_geometry = batch.get("front_geometry")
+                if front_geometry is not None:
+                    extra["front_geometry"] = front_geometry
                 # C20: per-frame Δt (source-video pacing) for the flow policy's Δt time-conditioning
                 sdt = batch.get("source_dt")
                 if sdt is not None:
