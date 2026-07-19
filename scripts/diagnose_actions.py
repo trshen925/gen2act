@@ -80,6 +80,9 @@ def main() -> None:
             wrist = batch.get("wrist_current")
             if torch.is_tensor(wrist):
                 kw["wrist_current"] = wrist.to(device)
+            front_geometry = batch.get("front_geometry")
+            if torch.is_tensor(front_geometry):
+                kw["front_geometry"] = front_geometry.to(device)
             out = model(src, tgt_h, prop, None, point_track, **kw)
             pred = out["action_pred"]
             if normalize:

@@ -242,6 +242,8 @@ def _build_fused_query_flow(cfg: dict):
         max_source_len=int(model_cfg.get("max_source_len", model_cfg["source_len"])),
         pad_source=bool(model_cfg.get("pad_source", False)),
         wrist_current_enabled=bool((model_cfg.get("wrist_current", {}) or {}).get("enabled", False)),
+        separate_stream_queries=bool(qr.get("separate_streams", False)),
+        front_depth_cfg=model_cfg.get("front_depth", {}) or {},
     )
     n_tr = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[fused_query_flow] total={sum(p.numel() for p in model.parameters())/1e6:.1f}M trainable={n_tr/1e6:.1f}M "

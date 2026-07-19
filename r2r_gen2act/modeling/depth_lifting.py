@@ -13,6 +13,70 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class DepthTo3DPatchGeometry(nn.Module):
+    """Align metric depth with the RGB crop and lift each ViT patch to 3D.
+
+    ``K`` is expressed in the final square model-input coordinates. Invalid
+    depth is resized with normalized mask weighting, so zero-valued holes do
+    not pull neighbouring surfaces towards the camera.
+
+    Returns ``[X, Y, Z, valid_ratio]`` in camera coordinates for every patch.
+    """
+
+    def __init__(self, patch_size: int = 14, image_size: int = 224,
+                 max_depth_m: float = 20.0) -> None:
+        super().__init__()
+        if image_size % patch_size:
+            raise ValueError(f"image_size={image_size} must be divisible by patch_size={patch_size}")
+        self.patch_size = int(patch_size)
+        self.image_size = int(image_size)
+        self.max_depth_m = float(max_depth_m)
+        side = self.image_size // self.patch_size
+        centers = torch.arange(side, dtype=torch.float32) * self.patch_size + self.patch_size / 2.0
+        py, px = torch.meshgrid(centers, centers, indexing="ij")
+        self.register_buffer("patch_px", px.reshape(1, -1), persistent=False)
+        self.register_buffer("patch_py", py.reshape(1, -1), persistent=False)
+
+    def _resize_center_crop_valid(self, depth_m: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        b, h, w = depth_m.shape
+        if h < w:
+            new_h = self.image_size
+            new_w = int(round(w * self.image_size / h))
+        else:
+            new_w = self.image_size
+            new_h = int(round(h * self.image_size / w))
+        valid = ((depth_m > 0) & (depth_m < self.max_depth_m)).to(torch.float32)
+        weighted = F.interpolate(
+            (depth_m * valid).unsqueeze(1), (new_h, new_w), mode="bilinear", align_corners=False)
+        weights = F.interpolate(
+            valid.unsqueeze(1), (new_h, new_w), mode="bilinear", align_corners=False)
+        resized = weighted / weights.clamp_min(1e-6)
+        top = max(0, (new_h - self.image_size) // 2)
+        left = max(0, (new_w - self.image_size) // 2)
+        return (
+            resized[:, :, top:top + self.image_size, left:left + self.image_size],
+            weights[:, :, top:top + self.image_size, left:left + self.image_size],
+        )
+
+    def forward(self, depth_mm: torch.Tensor, K: torch.Tensor) -> torch.Tensor:
+        if depth_mm.ndim != 3 or K.ndim != 2 or K.shape[-1] != 4:
+            raise ValueError(
+                f"Expected depth [B,H,W] and K [B,4], got {tuple(depth_mm.shape)} and {tuple(K.shape)}")
+        depth_m = depth_mm.to(torch.float32) / 1000.0
+        depth_crop, valid_crop = self._resize_center_crop_valid(depth_m)
+        ps = self.patch_size
+        valid_sum = F.avg_pool2d(valid_crop, ps, ps).flatten(1)
+        depth_sum = F.avg_pool2d(depth_crop * valid_crop, ps, ps).flatten(1)
+        patch_depth = depth_sum / valid_sum.clamp_min(1e-6)
+        valid_ratio = valid_sum.clamp(0.0, 1.0)
+        patch_depth = patch_depth * (valid_ratio > 0).to(patch_depth.dtype)
+
+        fx, fy, cx, cy = (K[:, i:i + 1].to(torch.float32) for i in range(4))
+        x = patch_depth * (self.patch_px - cx) / fx.clamp_min(1e-6)
+        y = patch_depth * (self.patch_py - cy) / fy.clamp_min(1e-6)
+        return torch.stack((x, y, patch_depth, valid_ratio), dim=-1)
+
+
 class DepthTo3DPatchPositions(nn.Module):
     """Backproject depth patch averages to 3D camera-frame positions.
 

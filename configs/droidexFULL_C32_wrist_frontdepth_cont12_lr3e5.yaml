@@ -1,0 +1,44 @@
+# C32: corrected C30 + current wrist RGB + current front FoundationStereo depth.
+# Source/current/wrist use independent 32-query readouts. Old C30's shared query
+# is copied into all three streams when the checkpoint is loaded.
+_base_: droidexFULL_C30_camera_corrected_cont12_lr3e5.yaml
+
+experiment:
+  name: droidexFULL_C32_wrist_frontdepth_cont12_lr3e5
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidexFULL_C32_wrist_frontdepth_cont12_lr3e5
+
+data:
+  wrist_current:
+    enabled: true
+    raw_root: /mnt/pfs/data/fenghaoran/droid/decompressed/1.0.1
+    video_name: steps_observation_wrist_image_left.mp4
+    frames_subdir: wrist_frames
+    frames_ext: jpg
+    allow_video_fallback: false
+  depth:
+    enabled: true
+    representation: patch_geometry
+    root: /mnt/pfs/data/shentingrui/droid-ex-3000-foundation-depth
+    geometry_name: patch_geometry_v1.npy
+    num_patches: 256
+
+model:
+  wrist_current:
+    enabled: true
+  query_readout:
+    separate_streams: true
+  front_depth:
+    enabled: true
+    geometry_dim: 4
+
+train:
+  resume_checkpoint: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidexFULL_C30_camera_corrected_cont12_lr3e5/c30_camera_corrected_ep11.pt
+  epochs: 12
+  optimizer:
+    name: adamw
+    lr: 0.00003
+    backbone_lr_multiplier: 0.3
+    llrd: 0.7
+    weight_decay: 0.05
+    betas: [0.9, 0.95]
+

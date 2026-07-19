@@ -1257,3 +1257,25 @@ XYZ MAE **1.855→1.672 cm（-9.9%）**，dx/dy corr 微升。ODE 积分更细 +
   | dx/dy/dz corr | .918/.937/.938 | .923/.936/.938 | dx略升，其余持平 |
 
 - **结论**: 单独加入当前腕部RGB没有降低总体XYZ误差；它对x/y有毫米级改善，但被z方向约0.25mm退化抵消。当前离线全窗口平均指标不支持“腕部RGB整体更好”，但也不能排除它只在夹取附近、遮挡或近距离子集有效，下一步应按gripper闭合前后的窗口做分段评估。
+
+## Exp C32 — corrected C30 + 当前腕部RGB + 当前正面FoundationStereo深度  🛠️ 实现/预处理中
+
+- **目的**: 在C31腕部视角基础上增加当前正面metric depth，重点验证深度是否改善夹取所需的z轴和近距离定位；仍只使用部署时可获得的当前观测，不输入未来深度。
+- **公平起点**: 与C31一样直接从corrected C30 ep11做weights-only warm restart，额外训练12 epoch、主LR `3e-5`。不从C31 ep12继续，以免把额外12 epoch训练预算混入深度收益。
+- **数据冻结**: 继续使用 `max_episodes=35696, val_count=500, split_seed=42`。冻结候选中33333/35696有FoundationStereo深度，32664成功生成geometry；另669个有深度但缺少可用内参，不能可信反投影。所有缺失clip都不删除，返回全零几何和`valid_ratio=0`，保证train/val集合不变。
+- **三路readout**: source demo、当前正面、当前腕部仍共享DINOv2-B及后续block，但各自使用独立的32个readout query。加载旧C30时，将旧共享query精确复制到三路，随后允许它们独立更新。
+- **3D lifting**: 不沿用C11的“XYZ单独MLP→32 depth tokens”。当前正面深度经过与RGB完全一致的resize+center crop和valid-aware插值；每个14×14 DINO patch生成相机系`[X,Y,Z,valid_ratio]`，与对应RGB patch逐点融合，再由当前正面的32 query readout。XYZ不使用`LayerNorm(3)`。
+- **预处理/I/O**: 原始`depth.npz`整段压缩，不在每个训练window中反复解压。`scripts/preprocess_c32_patch_geometry.py`一次性生成每clip的`patch_geometry_v1.npy`（float16，可mmap随机读取当前帧）。原始FoundationStereo结果保持只读。
+- **帧/几何验证**: clip 00000 local frame 0严格对应双目source frame 12；RGB、深度的桌面/机械臂/栏杆边缘对齐，EE投影落在夹爪区域。图保存在`artifacts/c32_depth_alignment/00000_frame000.png`。
+- **配置与入口**: 训练config `configs/droidexFULL_C32_wrist_frontdepth_cont12_lr3e5.yaml`；预处理 `bash scripts/run_preprocess_c32_patch_geometry.sh`；训练 `bash scripts/run_train_c32_wrist_frontdepth.sh`；正式评估 `bash scripts/run_eval_c32_wrist_frontdepth.sh <checkpoint>`。
+- **训练完成**: 12 epoch全部完成。`latest.pt`=ep12；按总val loss选择的`best.pt`=ep4，主要受gripper loss先降后升影响，不代表位置最佳。
+- **正式诊断**（冻结val前800 windows，32 ODE steps，16 samples，seed=0）:
+
+  | checkpoint | XYZ MAE | dx / dy / dz MAE | dx / dy / dz corr |
+  |---|---:|---:|---:|
+  | C32 ep12 latest | **1.562 cm** | 1.494 / 1.509 / 1.682 cm | .918 / .939 / .939 |
+  | C32 ep4 best | 1.634 cm | 1.547 / 1.568 / 1.787 cm | .917 / .940 / .937 |
+  | corrected C30 ep11 | 1.583 cm | 1.502 / 1.555 / 1.691 cm | .918 / .937 / .938 |
+  | C31 wrist ep12 | 1.582 cm | 1.485 / 1.547 / 1.716 cm | .923 / .936 / .938 |
+
+- **结论**: C32 latest相对corrected C30改善0.021cm（约1.3%），相对C31改善0.020cm，属于很小但同seed正式口径下可测的增益。改善主要来自dy（C30 1.555→C32 1.509cm），dz仅小幅优于C30（1.691→1.682cm）；尚不能说明深度解决了夹取时的厘米级z误差。ep4 best明显差于ep12 latest，再次说明位置模型应按正式action eval而不是总val loss选checkpoint。

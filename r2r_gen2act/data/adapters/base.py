@@ -107,6 +107,8 @@ class WindowedRobotDataset(Dataset):
         # C11: depth 3D lifting — load per-frame depth alongside RGB frames.
         depth_cfg = self.data_cfg.get("depth", {})
         self.depth_enabled = bool(depth_cfg.get("enabled", False))
+        self.depth_representation = str(depth_cfg.get("representation", "frames"))
+        self.depth_num_patches = int(depth_cfg.get("num_patches", 256))
         self.depth_frames_subdir = str(depth_cfg.get("frames_subdir", "depth_frames"))
         self.depth_ext = str(depth_cfg.get("frames_ext", "png"))
         self.source_jitter_cfg = self.data_cfg.get("source_jitter", {})
@@ -176,6 +178,10 @@ class WindowedRobotDataset(Dataset):
 
     def _get_camera_K_224(self, episode: Any, payload: Any) -> np.ndarray | None:
         """C11: camera intrinsics (fx, fy, cx, cy) scaled to the 224×224 image. Default None."""
+        return None
+
+    def _read_front_geometry_at(self, episode: Any, indices: list[int]) -> torch.Tensor | None:
+        """Read precomputed [X,Y,Z,valid_ratio] geometry for current front RGB patches."""
         return None
 
     def _future_traj_indices(self, num_steps: int, target_step: int) -> list[int]:
@@ -535,13 +541,20 @@ class WindowedRobotDataset(Dataset):
             sample["proprioception"] = torch.as_tensor(prop, dtype=torch.float32)
         if self.depth_enabled:
             depth_idx = future_idx if future_idx is not None else [target_step]
-            depth = self._read_depth_at(episode, depth_idx)
-            if depth is not None:
-                sample["depth_video"] = depth          # [T, H_d, W_d] uint16
-            K = self._get_camera_K_224(episode, payload)
-            if K is not None:
-                sample["camera_K"] = torch.as_tensor(
-                    np.asarray(K, dtype=np.float32), dtype=torch.float32)  # [4]
+            if self.depth_representation == "patch_geometry":
+                geometry = self._read_front_geometry_at(episode, depth_idx)
+                if geometry is None:
+                    geometry = torch.zeros(
+                        len(depth_idx), self.depth_num_patches, 4, dtype=torch.float32)
+                sample["front_geometry"] = geometry.to(torch.float32)
+            else:
+                depth = self._read_depth_at(episode, depth_idx)
+                if depth is not None:
+                    sample["depth_video"] = depth          # [T, H_d, W_d] uint16
+                K = self._get_camera_K_224(episode, payload)
+                if K is not None:
+                    sample["camera_K"] = torch.as_tensor(
+                        np.asarray(K, dtype=np.float32), dtype=torch.float32)  # [4]
         if self.point_tracking_enabled:
             sample["point_track"] = self._read_point_track(episode, target_step)
             if self.point_causal_window is not None:

@@ -20,6 +20,9 @@ def save_checkpoint(path: str | Path, model, optimizer, cfg: dict, epoch: int, m
 def load_checkpoint(path: str | Path, model, device, strict: bool = True) -> dict:
     ckpt = torch.load(path, map_location=device)
     state = ckpt["model_state_dict"]
+    compat = getattr(model, "checkpoint_state_dict_compat", None)
+    if callable(compat):
+        state = compat(state)
     if strict:
         model.load_state_dict(state, strict=True)
         return ckpt
@@ -46,4 +49,3 @@ def load_checkpoint(path: str | Path, model, device, strict: bool = True) -> dic
     if missing:
         print(f"[load_checkpoint] left random-init (not in ckpt): {missing}")
     return ckpt
-
