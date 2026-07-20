@@ -25,6 +25,10 @@ class PolicyPredictor:
         target = batch["target_history"].to(self.device)
         if source.dim() == 4:
             source = source.unsqueeze(0)
+        # A C33 single sample has source [T,C,H,W] but target [H,C,H,W],
+        # so batch the two streams independently rather than assuming they
+        # always have matching ranks.
+        if target.dim() == 4:
             target = target.unsqueeze(0)
         proprioception = batch.get("proprioception")
         if torch.is_tensor(proprioception):
@@ -52,7 +56,7 @@ class PolicyPredictor:
         wrist = batch.get("wrist_current")
         if torch.is_tensor(wrist):
             wrist = wrist.to(self.device)
-            if wrist.dim() == 3:
+            if wrist.dim() == 3 or (wrist.dim() == 4 and getattr(self.model, "current_history_len", 1) > 1):
                 wrist = wrist.unsqueeze(0)
             extra["wrist_current"] = wrist
         front_geometry = batch.get("front_geometry")

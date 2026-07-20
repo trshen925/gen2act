@@ -1,0 +1,27 @@
+# C33: C32 plus a fixed 0.66 s / 0.33 s / current RGB history for both cameras.
+# At 15 FPS, offsets [-10, -5, 0] are [-0.67 s, -0.33 s, 0 s]. The action target
+# remains at 0 s because target_history_len is deliberately left at one.
+_base_: droidexFULL_C32_wrist_frontdepth_cont12_lr3e5.yaml
+
+experiment:
+  name: droidexFULL_C33_front_wrist_history_cont10_lr3e5
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidexFULL_C33_front_wrist_history_cont10_lr3e5
+
+data:
+  current_history_offsets: [-10, -5, 0]
+
+train:
+  # Continue the interrupted C33 run from its completed epoch 1, including the
+  # optimizer state and epoch counter. Clear C32's inherited weights-only resume.
+  resume_checkpoint: null
+  resume_full_checkpoint: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidexFULL_C33_front_wrist_history_cont10_lr3e5/latest.pt
+  epochs: 10
+  # Per GPU. C33 used 3 for epoch 1; 12 makes better use of an 80 GiB A800.
+  batch_size: 12
+  optimizer:
+    name: adamw
+    lr: 0.00003
+    backbone_lr_multiplier: 0.3
+    llrd: 0.7
+    weight_decay: 0.05
+    betas: [0.9, 0.95]

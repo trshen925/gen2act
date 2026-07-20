@@ -28,7 +28,8 @@ class FusedQueryFlowPolicy(nn.Module):
                  current_full_patch: bool = False, max_source_len: int | None = None,
                  pad_source: bool = False, wrist_current_enabled: bool = False,
                  separate_stream_queries: bool = False,
-                 front_depth_cfg: dict | None = None) -> None:
+                 front_depth_cfg: dict | None = None,
+                 current_history_len: int = 1) -> None:
         super().__init__()
         # C21: current obs uses all 256 DINOv2 patch tokens (no readout compression) — the current
         # frame is the most action-relevant input, full patches preserve spatial detail.
@@ -41,6 +42,9 @@ class FusedQueryFlowPolicy(nn.Module):
         self.image_size = image_size
         self.num_queries = int(num_queries)
         self.source_len = int(source_len)
+        self.current_history_len = int(current_history_len)
+        if self.current_history_len < 1:
+            raise ValueError("current_history_len must be positive")
         # C24: with dynamic frame count, source_time_embed must cover the largest k (positions are
         # sliced [:t] at runtime). max_source_len defaults to source_len (static case).
         self.max_source_len = int(max_source_len) if max_source_len else int(source_len)
@@ -59,9 +63,17 @@ class FusedQueryFlowPolicy(nn.Module):
         # type embeddings so the flow head's VL mixer can tell the conditioning sources apart
         self.type_source = nn.Parameter(torch.randn(1, 1, dim) / dim**0.5)
         self.type_current = nn.Parameter(torch.randn(1, 1, dim) / dim**0.5)
+        if self.current_history_len > 1:
+            # Time tags distinguish the recent frames while preserving the C32
+            # current-frame interface and source-video encoding.
+            self.current_history_time_embed = nn.Parameter(
+                torch.randn(self.current_history_len, 1, dim) / dim**0.5)
         self.wrist_current_enabled = bool(wrist_current_enabled)
         if self.wrist_current_enabled:
             self.type_wrist_current = nn.Parameter(torch.randn(1, 1, dim) / dim**0.5)
+            if self.current_history_len > 1:
+                self.wrist_history_time_embed = nn.Parameter(
+                    torch.randn(self.current_history_len, 1, dim) / dim**0.5)
         # Keep the state-dict key for checkpoint compatibility, but do not ask
         # DDP to reduce a parameter for a condition stream that is disabled.
         self.type_point = nn.Parameter(
@@ -205,16 +217,33 @@ class FusedQueryFlowPolicy(nn.Module):
 
     def _build_cond(self, source_video, current_frame, point_track, ee, point_track_causal=None,
                     source_dt=None, wrist_current=None, front_geometry=None) -> torch.Tensor:
+        if current_frame.ndim == 4:
+            current_frame = current_frame.unsqueeze(1)
+        if current_frame.shape[1] != self.current_history_len:
+            raise ValueError(
+                f"Expected {self.current_history_len} current frames, got {current_frame.shape[1]}")
         if self.current_full_patch:
             if self.front_depth_enabled:
                 raise ValueError("front depth fusion requires current_full_patch=false")
-            cur = self._encode_current_full(current_frame)                       # [B, 256, dim]
+            cur = self._encode_current_full(current_frame[:, -1])                # [B, 256, dim]
         else:
             if self.front_depth_enabled and front_geometry is None:
                 raise ValueError("front_geometry is required when front depth is enabled")
+            if front_geometry is not None and front_geometry.shape[1] == 1 and current_frame.shape[1] > 1:
+                # C33 supplies metric geometry only for the newest observation.
+                # Older RGB frames receive an explicit zero/invalid geometry token.
+                expanded = front_geometry.new_zeros(
+                    front_geometry.shape[0], current_frame.shape[1],
+                    front_geometry.shape[2], front_geometry.shape[3])
+                expanded[:, -1] = front_geometry[:, 0]
+                front_geometry = expanded
             cur = self._readout(
-                current_frame.unsqueeze(1), None, self.type_current,
+                current_frame, None, self.type_current,
                 stream_name="current", patch_geometry=front_geometry)           # [B, 32, dim]
+            if self.current_history_len > 1:
+                cur = cur.reshape(current_frame.shape[0], self.current_history_len, self.num_queries, -1)
+                cur = cur + self.current_history_time_embed[:self.current_history_len].unsqueeze(0)
+                cur = cur.reshape(current_frame.shape[0], -1, cur.shape[-1])
         pad_to = self.max_source_len if self.pad_source else None
         groups = [self._readout(
             source_video, self.source_time_embed, self.type_source, source_dt, pad_to,
@@ -222,12 +251,21 @@ class FusedQueryFlowPolicy(nn.Module):
         if self.wrist_current_enabled:
             if wrist_current is None:
                 raise ValueError("wrist_current is required when model.wrist_current.enabled=true")
+            if wrist_current.ndim == 4:
+                wrist_current = wrist_current.unsqueeze(1)
+            if wrist_current.shape[1] != self.current_history_len:
+                raise ValueError(
+                    f"Expected {self.current_history_len} wrist frames, got {wrist_current.shape[1]}")
             if self.current_full_patch:
-                wrist = self._encode_current_full(wrist_current, self.type_wrist_current)
+                wrist = self._encode_current_full(wrist_current[:, -1], self.type_wrist_current)
             else:
                 wrist = self._readout(
-                    wrist_current.unsqueeze(1), None, self.type_wrist_current,
+                    wrist_current, None, self.type_wrist_current,
                     stream_name="wrist")
+                if self.current_history_len > 1:
+                    wrist = wrist.reshape(wrist_current.shape[0], self.current_history_len, self.num_queries, -1)
+                    wrist = wrist + self.wrist_history_time_embed[:self.current_history_len].unsqueeze(0)
+                    wrist = wrist.reshape(wrist_current.shape[0], -1, wrist.shape[-1])
             groups.append(wrist)
         if self.point_encoder is not None and point_track is not None:   # C7-flow has no point tracks
             groups.append(self.point_encoder(point_track) + self.type_point)
@@ -252,7 +290,7 @@ class FusedQueryFlowPolicy(nn.Module):
         if target_history is None or proprioception is None:
             raise ValueError("FusedQueryFlowPolicy needs source_video, target_history, proprioception(EE)")
         k_src = int(source_video.shape[1])   # runtime source frame count (dynamic under C24)
-        cond = self._build_cond(source_video, target_history[:, -1], point_track, proprioception,
+        cond = self._build_cond(source_video, target_history, point_track, proprioception,
                                 point_track_causal, source_dt, wrist_current, front_geometry)
         if self.training:
             if action_target is None:

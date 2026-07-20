@@ -244,6 +244,7 @@ def _build_fused_query_flow(cfg: dict):
         wrist_current_enabled=bool((model_cfg.get("wrist_current", {}) or {}).get("enabled", False)),
         separate_stream_queries=bool(qr.get("separate_streams", False)),
         front_depth_cfg=model_cfg.get("front_depth", {}) or {},
+        current_history_len=len(cfg.get("data", {}).get("current_history_offsets", [0])),
     )
     n_tr = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[fused_query_flow] total={sum(p.numel() for p in model.parameters())/1e6:.1f}M trainable={n_tr/1e6:.1f}M "
