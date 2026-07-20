@@ -1279,3 +1279,23 @@ XYZ MAE **1.855→1.672 cm（-9.9%）**，dx/dy corr 微升。ODE 积分更细 +
   | C31 wrist ep12 | 1.582 cm | 1.485 / 1.547 / 1.716 cm | .923 / .936 / .938 |
 
 - **结论**: C32 latest相对corrected C30改善0.021cm（约1.3%），相对C31改善0.020cm，属于很小但同seed正式口径下可测的增益。改善主要来自dy（C30 1.555→C32 1.509cm），dz仅小幅优于C30（1.691→1.682cm）；尚不能说明深度解决了夹取时的厘米级z误差。ep4 best明显差于ep12 latest，再次说明位置模型应按正式action eval而不是总val loss选checkpoint。
+
+## Exp C33 — C32 + 0.66s/0.33s 当前正面与腕部RGB历史  🛠️ 训练中
+
+- **动机**: RoboLab闭环诊断显示C30/C31/C32经常把高置信闭合放在chunk的`k=1`或更后，但部署只执行`k=0`后立即重规划，使离散闭合事件持续被推迟。引入短时观测历史，让策略可从真实运动状态分辨“仍在接近”与“上一个控制周期已到位”。
+- **输入**: 15 FPS下固定帧偏移`[-10,-5,0]`，即过去约0.67s、0.33s和当前。正面RGB和腕部RGB均使用三帧；每个流有独立的三位置learnable时间embedding。source demo、source_dt、EE投影proprio、8步动作chunk和数据划分均不变。
+- **深度范围**: FoundationStereo geometry仍只输入当前`0s`前面帧；历史两帧的geometry显式标为无效。故本实验只隔离测试视觉历史，不额外引入历史深度。
+- **目标对齐**: 不改变`target_history_len=1`或`target_step`，所以动作标签仍对应当前时刻；episode开头不足历史的索引安全地复制frame 0。
+- **初始化/训练**: 从C32 ep12 `latest.pt` weights-only warm start，新增`current_history_time_embed`与`wrist_history_time_embed`随机初始化；计划训练10 epoch，主LR `3e-5`。本机已完成ep1（val action loss `0.007896`，val gripper loss `0.286241`）并于2026-07-20暂停；后续通过C33 `latest.pt`完整恢复模型、optimizer和epoch计数，从ep2继续。集群续训每卡batch由3提高到12。
+- **配置与入口**: `configs/droidexFULL_C33_front_wrist_history_cont10_lr3e5.yaml`；训练`bash scripts/run_train_c33_front_wrist_history.sh`；正式评估`bash scripts/run_eval_c33_front_wrist_history.sh <checkpoint>`。
+- **部署契约**: 部署必须按同样的`[-10,-5,0]`偏移维护两路相机环形缓冲区，传入front/wrist `[1,3,3,224,224]`，而非继续只传单帧；当前深度仅对应第三帧。
+- **训练完成**: 10 epoch全部完成。按总val loss选择的`best.pt`=ep2（主要受gripper loss影响）；`latest.pt`=ep10，其val action loss/MAE继续改善，不能用`best.pt`替代正式action eval选点。
+- **正式action评估**（冻结val前800 windows，32 ODE steps，16 samples，seed=0）:
+
+  | checkpoint | XYZ MAE | dx / dy / dz MAE | dx / dy / dz corr | k0 XYZ MAE |
+  |---|---:|---:|---:|---:|
+  | C33 ep10 latest | **1.442 cm** | 1.339 / 1.412 / 1.575 cm | .935 / .947 / .945 | **0.64 cm** |
+  | C33 ep2 best | 1.533 cm | 1.455 / 1.468 / 1.675 cm | .935 / .946 / .941 | 0.72 cm |
+  | C32 ep12 latest | 1.562 cm | 1.494 / 1.509 / 1.682 cm | .918 / .939 / .939 | — |
+
+- **离线结论**: C33 ep10相对C32 ep12的XYZ MAE降低`0.120 cm`（约`7.7%`），三轴均改善，其中dx改善最大；相对C33 ep2降低`0.091 cm`。部署应优先测试ep10，但本实验的核心假设仍须在RoboLab闭环检查gripper闭合事件能否从`k=1`推进到`k=0`，普通action评估不能回答这一点。
