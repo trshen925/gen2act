@@ -35,6 +35,8 @@ class WindowedRobotDataset(Dataset):
         # append normalized task progress (target_step/num_steps) as an extra proprioception dim
         # (a coarse localization cue for the demo: "how far into the task am I").
         self.proprioception_append_progress = bool(self.proprioception_cfg.get("append_progress", False))
+        self.proprioception_append_gripper = bool(
+            self.proprioception_cfg.get("append_current_gripper", False))
         # Step 7: per-episode tracked EE-neighborhood points (preproc/cotracker_ee_points.py).
         self.point_tracking_cfg = self.data_cfg.get("point_tracking", {})
         self.point_tracking_enabled = bool(self.point_tracking_cfg.get("enabled", False))
@@ -80,6 +82,15 @@ class WindowedRobotDataset(Dataset):
         source_float_cfg = self.data_cfg.get("source_float", {})
         self.source_float_enabled = bool(source_float_cfg.get("enabled", False))
         self.source_float_frac = float(source_float_cfg.get("float_frac", 0.2))
+        # C34: asymmetric demo cropping. Keep the historical `float_frac` as
+        # the fallback for older experiments, while allowing a front-only crop
+        # so the source always retains the late grasp/release portion.
+        self.source_float_front_frac = float(
+            source_float_cfg.get("front_max_frac", self.source_float_frac))
+        self.source_float_back_frac = float(
+            source_float_cfg.get("back_max_frac", self.source_float_frac))
+        if self.source_float_front_frac < 0.0 or self.source_float_back_frac < 0.0:
+            raise ValueError("source_float front/back fractions must be non-negative")
         # C20: Δt time-conditioning — emit per-frame real seconds-since-previous-sampled-frame so the
         # model knows the demo's pacing (fixed 8 frames, but a 3s clip vs 30s clip → very different Δt).
         self.dt_time_enabled = bool(self.data_cfg.get("dt_time_embed", {}).get("enabled", False))
@@ -342,9 +353,10 @@ class WindowedRobotDataset(Dataset):
             # C18: float the linspace window start/end by up to float_frac of the clip (train only),
             # so the sampled frames cover a different span each epoch → demo diversity.
             if self.source_float_enabled and self.split == "train" and source_length > 2:
-                span = self.source_float_frac * (source_length - 1)
-                lo = int(round(float(torch.rand(()).item()) * span))
-                hi = int(round((source_length - 1) - float(torch.rand(()).item()) * span))
+                front_span = self.source_float_front_frac * (source_length - 1)
+                back_span = self.source_float_back_frac * (source_length - 1)
+                lo = int(round(float(torch.rand(()).item()) * front_span))
+                hi = int(round((source_length - 1) - float(torch.rand(()).item()) * back_span))
                 if hi - lo < k:
                     lo, hi = 0, source_length - 1
             indices = [int(round(x)) for x in np.linspace(lo, hi, k)]
@@ -558,6 +570,17 @@ class WindowedRobotDataset(Dataset):
                 denom = max(1, int(episode.num_steps) - 1)
                 progress = float(min(1.0, max(0.0, target_step / denom)))
                 prop = np.concatenate([prop, np.asarray([progress], dtype=np.float32)])
+            if self.proprioception_append_gripper:
+                grip_seq = payload.get("observations", {}).get("gripper_position")
+                if grip_seq is None:
+                    grip_seq = payload.get("action_dict", {}).get("gripper_position")
+                if grip_seq is None:
+                    raise KeyError("append_current_gripper requires observations.gripper_position")
+                grip_values = np.asarray(grip_seq, dtype=np.float32).reshape(-1)
+                grip_idx = min(max(0, int(target_step)), len(grip_values) - 1)
+                grip_state = float(
+                    grip_values[grip_idx] > float(self.data_cfg.get("gripper_threshold", 0.0)))
+                prop = np.concatenate([prop, np.asarray([grip_state], dtype=np.float32)])
             sample["proprioception"] = torch.as_tensor(prop, dtype=torch.float32)
         if self.depth_enabled:
             depth_idx = future_idx if future_idx is not None else [target_step]
