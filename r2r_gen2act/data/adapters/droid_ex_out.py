@@ -90,8 +90,20 @@ class DroidExOutDataset(OpenXDroidDataset):
         ids = [d.name for d in dirs]
         val_count = self.data_cfg.get("val_count")
         val_count = None if val_count in (None, "") else int(val_count)
+        # Allow later experiments to add newly collected clips to training without
+        # changing the historical validation IDs. The held-out IDs are selected
+        # only from the same sorted prefix used by the reference experiment; all
+        # IDs outside that prefix are train-only.
+        val_pool_max_episodes = self.data_cfg.get("val_pool_max_episodes")
+        if val_pool_max_episodes not in (None, ""):
+            val_pool_n = int(val_pool_max_episodes)
+            if val_pool_n <= 0:
+                raise ValueError("data.val_pool_max_episodes must be positive")
+            val_pool_ids = ids[:val_pool_n]
+        else:
+            val_pool_ids = ids
         _, val_ids = split_episode_ids(
-            ids, float(self.data_cfg.get("val_ratio", 0.2)),
+            val_pool_ids, float(self.data_cfg.get("val_ratio", 0.2)),
             int(self.data_cfg.get("split_seed", 42)), val_count)
 
         episodes: list[EpisodeRecord] = []

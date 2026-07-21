@@ -1299,3 +1299,13 @@ XYZ MAE **1.855→1.672 cm（-9.9%）**，dx/dy corr 微升。ODE 积分更细 +
   | C32 ep12 latest | 1.562 cm | 1.494 / 1.509 / 1.682 cm | .918 / .939 / .939 | — |
 
 - **离线结论**: C33 ep10相对C32 ep12的XYZ MAE降低`0.120 cm`（约`7.7%`），三轴均改善，其中dx改善最大；相对C33 ep2降低`0.091 cm`。部署应优先测试ep10，但本实验的核心假设仍须在RoboLab闭环检查gripper闭合事件能否从`k=1`推进到`k=0`，普通action评估不能回答这一点。
+
+## Exp C34 — C33 + current gripper state + full training pool  🛠️ 待训练
+
+- **动机**: C33实际闭环能学会夹住但不稳定松开。C34只增加数据中当前时刻的真实夹爪二值状态，避免策略必须从RGB猜测“当前已经闭合/仍然打开”；不增加事件头、不改变gripper loss或部署策略。
+- **输入变化**: `proprioception`由C33的`[u_norm, v_norm, z]`扩展为`[u_norm, v_norm, z, current_gripper_state]`，状态定义与标签相同：`gripper_position > 0.5`为1，否则为0。部署必须同步传入当前RoboLab夹爪状态。
+- **source采样**: C34将训练集demo的`source_float`改为非对称裁剪：随机从前端移除`0%..40%`，后端移除固定`0%`；因此不删除任何window/episode，只保证source始终包含视频后段。验证集仍不做该随机裁剪。
+- **数据变化**: 数据目录当前共有43,415条clip。C34使用全部clip；验证集仍只从旧的排序前35,696条按`split_seed=42, val_count=500`生成，因此与C33严格相同（487有效episodes、5210windows）；新增7,719条全部为train-only。
+- **初始化/训练**: 从C33 ep10 `latest.pt` weights-only warm start；`ee_mlp`前三维权重前缀复制，新增夹爪维度随机初始化；其余模型、历史RGB、当前depth、loss和训练超参保持C33不变，训练10 epoch、主LR `3e-5`、每卡batch 12。
+- **预处理**: 新增clip的原始腕部视频全部存在，但需先执行`START_ID=35696 END_ID=43415 WORKERS=16 bash scripts/run_preprocess_wrist_frames.sh`生成缓存。新增clip已有6847/7719条FoundationStereo geometry；缺失条目按invalid geometry处理，仍纳入训练。
+- **配置与入口**: `configs/droidexFULL_C34_current_gripper_fulltrain.yaml`；训练`bash scripts/run_train_c34_current_gripper.sh`；正式评估`bash scripts/run_eval_c34_current_gripper.sh <checkpoint>`。

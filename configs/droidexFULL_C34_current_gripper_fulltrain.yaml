@@ -1,0 +1,30 @@
+# C34: C33 plus the exact current gripper state, with all available clips used
+# for training. Validation remains the original C33/C32 frozen pool.
+_base_: droidexFULL_C33_front_wrist_history_cont10_lr3e5.yaml
+
+experiment:
+  name: droidexFULL_C34_current_gripper_fulltrain
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidexFULL_C34_current_gripper_fulltrain
+
+data:
+  # Use every currently available numeric clip. Select the old 35,696-clip
+  # prefix for the historical val split; all later clips are train-only.
+  max_episodes: 43415
+  val_pool_max_episodes: 35696
+  proprioception:
+    append_current_gripper: true
+  source_float:
+    enabled: true
+    # Train-only asymmetric source sampling: randomly remove 0..40% from the
+    # beginning, but always retain the full tail where release often occurs.
+    front_max_frac: 0.4
+    back_max_frac: 0.0
+
+model:
+  proprioception_dim: 4
+
+train:
+  resume_checkpoint: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidexFULL_C33_front_wrist_history_cont10_lr3e5/latest.pt
+  resume_full_checkpoint: null
+  epochs: 10
+  batch_size: 12

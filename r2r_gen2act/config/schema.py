@@ -34,9 +34,13 @@ def validate_config(cfg: dict) -> None:
     if not prop_enabled and prop_dim != 0:
         raise ValueError("model.proprioception_dim must be 0 when data.proprioception.enabled is false")
     if prop_enabled:
-        # model receives proprioception.dims values, plus 1 extra dim when append_progress is on.
+        # Model receives proprioception.dims values plus optional scalar state cues.
         expected = int(prop_cfg.get("dims", prop_dim))
         if bool(prop_cfg.get("append_progress", False)):
             expected += 1
+        if bool(prop_cfg.get("append_current_gripper", False)):
+            expected += 1
         if expected != prop_dim:
-            raise ValueError("data.proprioception.dims (+1 if append_progress) must match model.proprioception_dim")
+            raise ValueError(
+                "data.proprioception.dims (+ optional progress/current-gripper dims) "
+                "must match model.proprioception_dim")

@@ -17,9 +17,28 @@ def save_checkpoint(path: str | Path, model, optimizer, cfg: dict, epoch: int, m
     }, path)
 
 
+def save_slim_checkpoint(path: str | Path, checkpoint: dict) -> None:
+    """Save an eval/deploy checkpoint without optimizer state."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    slim = {
+        "epoch": checkpoint.get("epoch"),
+        "model_state_dict": checkpoint["model_state_dict"],
+        "config": checkpoint.get("config"),
+        "metrics": checkpoint.get("metrics"),
+        "slim_checkpoint": True,
+    }
+    torch.save(slim, path)
+
+
 def load_checkpoint(path: str | Path, model, device, strict: bool = True) -> dict:
     ckpt = torch.load(path, map_location=device)
-    state = ckpt["model_state_dict"]
+    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+        state = ckpt["model_state_dict"]
+    else:
+        # Also support plain state_dict files for deployment/export tooling.
+        state = ckpt
+        ckpt = {"model_state_dict": state}
     compat = getattr(model, "checkpoint_state_dict_compat", None)
     if callable(compat):
         state = compat(state)
