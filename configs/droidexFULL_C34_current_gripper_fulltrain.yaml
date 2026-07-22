@@ -15,8 +15,9 @@ data:
     append_current_gripper: true
   source_float:
     enabled: true
-    # Train-only asymmetric source sampling: randomly remove 0..40% from the
-    # beginning, but always retain the full tail where release often occurs.
+    # Train-only asymmetric source sampling: randomly remove up to 40% from the
+    # beginning, but never begin after the current target step. This preserves
+    # target/demo temporal consistency while retaining prefix-crop diversity.
     front_max_frac: 0.4
     back_max_frac: 0.0
 

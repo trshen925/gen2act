@@ -233,6 +233,11 @@ def run_epoch(model, loader, codec, cfg, device, optimizer=None, train: bool = T
                     # eval samples from noise so no target is passed.
                     pose_dims = codec.pose_dims
                     action_target = codec.normalize(batch["action"][..., :pose_dims].to(device))
+                    if bool(cfg["model"].get("flow_dit", {}).get("diffuse_gripper", False)):
+                        # Binary {0,1} is represented as {-1,1}, just like the
+                        # normalized continuous action dimensions.
+                        gripper = batch["gripper"].to(device=device, dtype=action_target.dtype).unsqueeze(-1)
+                        action_target = torch.cat((action_target, gripper.mul(2.0).sub(1.0)), dim=-1)
                 point_track = batch.get("point_track")
                 extra = {}
                 ptc = batch.get("point_track_causal")
@@ -457,7 +462,7 @@ def train(cfg: dict, device: str | None = None) -> Path:
                 "train_terminate_loss": train_metrics["terminate_loss"],
             }
             for key, value in train_metrics.items():
-                if key.startswith("action_dim_") or key in ("action_mae", "action_rmse"):
+                if key.startswith("action_dim_") or key in ("action_mae", "action_rmse", "gripper_accuracy", "gripper_brier"):
                     row[f"train_{key}"] = value
             if val_metrics is not None:
                 row["val_loss"] = val_metrics["loss"]
@@ -465,7 +470,7 @@ def train(cfg: dict, device: str | None = None) -> Path:
                 row["val_gripper_loss"] = val_metrics["gripper_loss"]
                 row["val_terminate_loss"] = val_metrics["terminate_loss"]
                 for key, value in val_metrics.items():
-                    if key.startswith("action_dim_") or key in ("action_mae", "action_rmse"):
+                    if key.startswith("action_dim_") or key in ("action_mae", "action_rmse", "gripper_accuracy", "gripper_brier"):
                         row[f"val_{key}"] = value
             history.append(row)
             _write_loss_history(out_dir, history)

@@ -78,7 +78,9 @@ def main() -> None:
                         batch.get("point_track"), **kw)
             pred = out["action_pred"]
             if normalize:
-                pred = codec.unnormalize(pred)
+                pred = codec.unnormalize(pred[..., :pose_dims])
+            else:
+                pred = pred[..., :pose_dims]
             pred = pred[:, 0, :3].float().cpu().numpy()                         # model +H delta
             gtd = torch.stack([s["action"] for s in samples])[:, 0, :3].numpy()  # GT +H delta
             grip = torch.stack([s["gripper"] for s in samples])[:, 0].numpy()    # gripper at +H

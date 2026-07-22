@@ -1,0 +1,16 @@
+# C35: C34's flow action head with gripper as its 10th dimension. Do not pass
+# the current gripper state as a condition.
+_base_: droidexFULL_C34_current_gripper_fulltrain.yaml
+
+experiment:
+  name: droidexFULL_C35_diffuse_gripper_fulltrain
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidexFULL_C35_diffuse_gripper_fulltrain
+
+model:
+  proprioception_dim: 3
+  flow_dit:
+    diffuse_gripper: true
+
+data:
+  proprioception:
+    append_current_gripper: false

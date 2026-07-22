@@ -80,7 +80,9 @@ def main() -> None:
             out = model(src, tgt_h, prop, None, pt, **kw)
             p = out["action_pred"]
             if normalize:
-                p = codec.unnormalize(p)
+                p = codec.unnormalize(p[..., :pose_dims])
+            else:
+                p = p[..., :pose_dims]
             pred6.append(p.reshape(-1, pose_dims)[:, 3:9].float().cpu())
             tgt6.append(batch["action"][..., :pose_dims].reshape(-1, pose_dims)[:, 3:9].float())
             n += src.shape[0]

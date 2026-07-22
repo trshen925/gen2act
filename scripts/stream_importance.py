@@ -90,7 +90,9 @@ def main() -> None:
                 out = model(src_, tgt_, prop_, None, pt_, **kw)
                 p = out["action_pred"]
                 if normalize:
-                    p = codec.unnormalize(p)
+                    p = codec.unnormalize(p[..., :pose_dims])
+                else:
+                    p = p[..., :pose_dims]
                 return p.reshape(-1, pose_dims).float().cpu().numpy()
 
             preds["intact"].append(run(src, tgt_h, prop, pt, ptc))
