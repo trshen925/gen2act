@@ -76,7 +76,10 @@ def main() -> None:
             for k in kinds:
                 out = model(perturb(src, k), perturb(tgt, k), prop, None, None)
                 p = out["action_pred"]
-                if normalize: p = codec.unnormalize(p)
+                if normalize:
+                    p = codec.unnormalize(p[..., :pose_dims])
+                else:
+                    p = p[..., :pose_dims]
                 preds[k].append(p.reshape(-1, pose_dims).float().cpu().numpy())
             tgts.append(batch["action"][..., :pose_dims].reshape(-1, pose_dims).numpy())
             n += src.shape[0]

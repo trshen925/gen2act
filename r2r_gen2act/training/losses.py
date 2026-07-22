@@ -9,6 +9,7 @@ from r2r_gen2act.data.action.codec import ActionCodec
 def compute_losses(outputs: dict[str, torch.Tensor], batch: dict, codec: ActionCodec, cfg: dict) -> dict[str, torch.Tensor]:
     weights = cfg["train"].get("losses", {})
     pose_dims = codec.pose_dims
+    diffuse_gripper = bool(cfg.get("model", {}).get("flow_dit", {}).get("diffuse_gripper", False))
     # Leading dims may be [B] (single action) or [B, N] (action chunk); flatten them so the same
     # code path handles both. The last dim is always the action/pose dimension.
     action = batch["action"][..., :pose_dims].reshape(-1, pose_dims)
@@ -19,21 +20,25 @@ def compute_losses(outputs: dict[str, torch.Tensor], batch: dict, codec: ActionC
         # Flow-matching DiT. Training: the head returns predicted/target velocity (loss = MSE on the
         # flow field). Eval: the head samples an action chunk (Euler integration); we then report the
         # same MAE/RMSE metrics as regression so held-out quality is directly comparable.
+        flow_dims = pose_dims + int(diffuse_gripper)
         if "pred_velocity" in outputs:
-            pred_v = outputs["pred_velocity"].reshape(-1, pose_dims)
-            tgt_v = outputs["target_velocity"].reshape(-1, pose_dims)
+            pred_v = outputs["pred_velocity"].reshape(-1, flow_dims)
+            tgt_v = outputs["target_velocity"].reshape(-1, flow_dims)
             per_dim = (pred_v - tgt_v).pow(2).mean(dim=0)
             dim_losses = [per_dim[dim] for dim in range(pose_dims)]
-            loss_action = torch.stack(dim_losses).mean()
+            loss_action = per_dim.mean()
             metrics = {}
         else:
-            action_pred = outputs["action_pred"].reshape(-1, pose_dims)
+            action_pred = outputs["action_pred"].reshape(-1, flow_dims)
             target = codec.normalize(action)  # flow head predicts normalized [-1, 1] actions
+            if diffuse_gripper:
+                grip = batch["gripper"].reshape(-1, 1).to(device=target.device, dtype=target.dtype)
+                target = torch.cat((target, grip.mul(2.0).sub(1.0)), dim=-1)
             per_dim = (action_pred - target).pow(2).mean(dim=0)
             dim_losses = [per_dim[dim] for dim in range(pose_dims)]
-            loss_action = torch.stack(dim_losses).mean()
-            pred_units = codec.unnormalize(action_pred)
-            tgt_units = codec.unnormalize(target)
+            loss_action = per_dim.mean()
+            pred_units = codec.unnormalize(action_pred[..., :pose_dims])
+            tgt_units = codec.unnormalize(target[..., :pose_dims])
             abs_err = (pred_units - tgt_units).abs()
             metrics = {
                 "action_mae": abs_err.mean(),
@@ -41,6 +46,12 @@ def compute_losses(outputs: dict[str, torch.Tensor], batch: dict, codec: ActionC
             }
             for dim in range(pose_dims):
                 metrics[f"action_dim_{dim}_mae"] = abs_err[:, dim].mean()
+            if diffuse_gripper:
+                gripper_prob = ((action_pred[:, pose_dims] + 1.0) * 0.5).clamp(0.0, 1.0)
+                gripper_target = batch["gripper"].reshape(-1).to(
+                    device=gripper_prob.device, dtype=gripper_prob.dtype)
+                metrics["gripper_accuracy"] = ((gripper_prob >= 0.5) == (gripper_target >= 0.5)).float().mean()
+                metrics["gripper_brier"] = (gripper_prob - gripper_target).pow(2).mean()
     elif action_mode == "regression":
         action_pred = outputs["action_pred"].reshape(-1, pose_dims)
         # When regression_normalize is on, train against per-dim [-1,1] targets (clamped to
@@ -83,11 +94,18 @@ def compute_losses(outputs: dict[str, torch.Tensor], batch: dict, codec: ActionC
             dim_losses.append(F.cross_entropy(action_logits[:, dim, :], action_bins[:, dim]))
         loss_action = torch.stack(dim_losses).mean()
         metrics = {}
-    loss_gripper = F.cross_entropy(outputs["gripper_logits"].reshape(-1, 2), batch["gripper"].reshape(-1).long())
+    if diffuse_gripper:
+        # This metric is already included in loss_action; do not add it again.
+        if "pred_velocity" in outputs:
+            loss_gripper = (pred_v[..., pose_dims] - tgt_v[..., pose_dims]).pow(2).mean()
+        else:
+            loss_gripper = (action_pred[..., pose_dims] - target[..., pose_dims]).pow(2).mean()
+    else:
+        loss_gripper = F.cross_entropy(outputs["gripper_logits"].reshape(-1, 2), batch["gripper"].reshape(-1).long())
     loss_terminate = F.cross_entropy(outputs["terminate_logits"].reshape(-1, 2), batch["terminate"].reshape(-1).long())
     total = (
         float(weights.get("action_weight", 1.0)) * loss_action
-        + float(weights.get("gripper_weight", 0.2)) * loss_gripper
+        + (0.0 if diffuse_gripper else float(weights.get("gripper_weight", 0.2))) * loss_gripper
         + float(weights.get("terminate_weight", 0.1)) * loss_terminate
     )
     losses = {"loss": total, "action_loss": loss_action, "gripper_loss": loss_gripper, "terminate_loss": loss_terminate, **metrics}

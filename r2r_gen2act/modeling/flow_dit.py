@@ -145,14 +145,15 @@ class SelfAttentionMixer(nn.Module):
 class FlowMatchingDiTHead(nn.Module):
     """Flow-matching DiT action head, faithful to GR00T IDM. Conditioning is a token sequence
     [B, S, cond_dim] (gen2act resampler/fusion tokens). Predicts an action chunk
-    [B, horizon, action_dim] (pose, normalized). Gripper/terminate are separate per-step binary heads
-    on the pooled (mixed) conditioning, kept for compatibility with the gen2act losses."""
+    [B, horizon, action_dim] (normalized pose, optionally followed by gripper). Terminate remains a
+    separate per-step binary head on pooled conditioning."""
 
     def __init__(self, cond_dim: int, action_dim: int, horizon: int, hidden_dim: int = 1024,
                  num_layers: int = 8, heads: int = 16, num_inference_steps: int = 16,
                  dropout: float = 0.1, num_eval_samples: int = 1, time_sampling: str = "beta",
                  noise_beta_alpha: float = 1.5, noise_beta_beta: float = 1.0, noise_s: float = 0.999,
-                 vl_mixer_layers: int = 4, interleave_self_attention: bool = True) -> None:
+                 vl_mixer_layers: int = 4, interleave_self_attention: bool = True,
+                 diffuse_gripper: bool = False) -> None:
         super().__init__()
         self.action_dim = int(action_dim)
         self.horizon = int(horizon)
@@ -160,6 +161,7 @@ class FlowMatchingDiTHead(nn.Module):
         self.num_inference_steps = int(num_inference_steps)
         self.num_eval_samples = int(num_eval_samples)
         self.interleave = bool(interleave_self_attention)
+        self.diffuse_gripper = bool(diffuse_gripper)
         # flow timestep sampling: "beta" matches IDM (Beta(alpha,beta) via t=(s-sample)/s); "uniform"
         # is the plain torch.rand baseline.
         self.time_sampling = str(time_sampling)
@@ -181,6 +183,10 @@ class FlowMatchingDiTHead(nn.Module):
         self.action_out = nn.Linear(hidden_dim, action_dim)
         # auxiliary per-horizon-step binary heads on pooled (mixed) conditioning.
         self.gripper_proj = nn.Linear(hidden_dim, horizon * 2)
+        if self.diffuse_gripper:
+            # Keep this historical checkpoint key, but do not train the
+            # superseded classifier when gripper is in the flow vector.
+            self.gripper_proj.requires_grad_(False)
         self.terminate_proj = nn.Linear(hidden_dim, horizon * 2)
 
     def _aux(self, vl: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -222,12 +228,14 @@ class FlowMatchingDiTHead(nn.Module):
         velocity = target_actions - noise
         pred_v = self._velocity(noisy, t, vl)
         gripper, terminate = self._aux(vl)
-        return {
+        out = {
             "pred_velocity": pred_v,
             "target_velocity": velocity,
-            "gripper_logits": gripper,
             "terminate_logits": terminate,
         }
+        if not self.diffuse_gripper:
+            out["gripper_logits"] = gripper
+        return out
 
     def _sample_once(self, vl: torch.Tensor) -> torch.Tensor:
         b = vl.shape[0]
@@ -249,8 +257,10 @@ class FlowMatchingDiTHead(nn.Module):
             acc = acc + self._sample_once(vl)
         x = acc / k
         gripper, terminate = self._aux(vl)
-        return {
+        out = {
             "action_pred": x,
-            "gripper_logits": gripper,
             "terminate_logits": terminate,
         }
+        if not self.diffuse_gripper:
+            out["gripper_logits"] = gripper
+        return out

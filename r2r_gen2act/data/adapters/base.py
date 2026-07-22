@@ -355,6 +355,11 @@ class WindowedRobotDataset(Dataset):
             if self.source_float_enabled and self.split == "train" and source_length > 2:
                 front_span = self.source_float_front_frac * (source_length - 1)
                 back_span = self.source_float_back_frac * (source_length - 1)
+                # Keep the randomly cropped demonstration anchored no later
+                # than the current target window. Otherwise, an early target
+                # state may be paired with a source video that begins later.
+                target_step = start_index + self.target_history_len - 1 + self.target_offset
+                front_span = min(front_span, max(0, int(target_step)))
                 lo = int(round(float(torch.rand(()).item()) * front_span))
                 hi = int(round((source_length - 1) - float(torch.rand(()).item()) * back_span))
                 if hi - lo < k:

@@ -79,7 +79,9 @@ def main() -> None:
                         batch.get("point_track"), **kw)
             pred = out["action_pred"]
             if normalize:
-                pred = codec.unnormalize(pred)
+                pred = codec.unnormalize(pred[..., :pose_dims])
+            else:
+                pred = pred[..., :pose_dims]
             pred_d = pred[:, 0, :3].float().cpu().numpy()                       # +5 cam-frame delta
             gt_d = torch.stack([s["action"] for s in samples])[:, 0, :3].numpy()
             rows.append((gt_d, pred_d))

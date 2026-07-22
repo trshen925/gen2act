@@ -62,7 +62,8 @@ def main() -> None:
     model.eval()
     normalize = bool(cfg.get("action", {}).get("regression_normalize", False)) or str(cfg["action"]["mode"]) == "flow"
 
-    preds, tgts = [], []
+    diffuse_gripper = bool(cfg.get("model", {}).get("flow_dit", {}).get("diffuse_gripper", False))
+    preds, tgts, gripper_preds, gripper_tgts = [], [], [], []
     n = 0
     with torch.no_grad():
         for batch in loader:
@@ -86,9 +87,14 @@ def main() -> None:
             out = model(src, tgt_h, prop, None, point_track, **kw)
             pred = out["action_pred"]
             if normalize:
-                pred = codec.unnormalize(pred)
-            preds.append(pred.reshape(-1, pose_dims).float().cpu().numpy())
+                pose_pred = codec.unnormalize(pred[..., :pose_dims])
+            else:
+                pose_pred = pred[..., :pose_dims]
+            preds.append(pose_pred.reshape(-1, pose_dims).float().cpu().numpy())
             tgts.append(batch["action"][..., :pose_dims].reshape(-1, pose_dims).numpy())
+            if diffuse_gripper:
+                gripper_preds.append(((pred[..., pose_dims] + 1.0) * 0.5).clamp(0.0, 1.0).reshape(-1).float().cpu().numpy())
+                gripper_tgts.append(batch["gripper"].reshape(-1).numpy())
             n += src.shape[0]
             if n >= args.max_windows:
                 break
@@ -112,6 +118,13 @@ def main() -> None:
     base_mae = np.abs(T[:, :3] - T[:, :3].mean(0)).mean() * 100
     print(f"\nXYZ MAE = {xyz_mae:.3f} cm   |  'predict-mean' baseline = {base_mae:.3f} cm   "
           f"({'BEATS' if xyz_mae < base_mae else 'WORSE THAN'} baseline by {abs(1-xyz_mae/base_mae)*100:.1f}%)")
+    if diffuse_gripper:
+        Gp = np.concatenate(gripper_preds)[:len(P)]
+        Gt = np.concatenate(gripper_tgts)[:len(P)].astype(np.int64)
+        g_acc = float(((Gp >= 0.5) == (Gt > 0)).mean())
+        g_brier = float(np.square(Gp - Gt).mean())
+        g_base = max(float(Gt.mean()), 1.0 - float(Gt.mean()))
+        print(f"Gripper: accuracy={g_acc:.4f}  brier={g_brier:.4f}  majority baseline={g_base:.4f}  positive_rate={Gt.mean():.4f}")
 
     # ── per-chunk-step breakdown ──────────────────────────────────────────────
     n_win = len(P) // chunk_size

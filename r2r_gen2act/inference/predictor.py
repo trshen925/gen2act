@@ -69,15 +69,23 @@ class PolicyPredictor:
         if "action_pred" in outputs:
             pred = outputs["action_pred"]
             action_mode = str(self.cfg.get("action", {}).get("mode", ""))
+            pose_dims = self.codec.pose_dims
+            diffuse_gripper = bool(self.cfg.get("model", {}).get("flow_dit", {}).get("diffuse_gripper", False))
             # flow head emits normalized [-1,1] actions; regression may too (regression_normalize).
             if action_mode == "flow" or bool(self.cfg.get("action", {}).get("regression_normalize", False)):
-                pred = self.codec.unnormalize(pred)
-            pose = pred.cpu()
+                pose = self.codec.unnormalize(pred[..., :pose_dims])
+            else:
+                pose = pred[..., :pose_dims]
+            pose = pose.cpu()
             bins = None
         else:
             bins = outputs["action_logits"].argmax(dim=-1)
             pose = self.codec.decode(bins).cpu()
-        gripper_prob = outputs["gripper_logits"].softmax(dim=-1).cpu()
+        if diffuse_gripper:
+            gripper_open = ((pred[..., pose_dims] + 1.0) * 0.5).clamp(0.0, 1.0)
+            gripper_prob = torch.stack((1.0 - gripper_open, gripper_open), dim=-1).cpu()
+        else:
+            gripper_prob = outputs["gripper_logits"].softmax(dim=-1).cpu()
         terminate_prob = outputs["terminate_logits"].softmax(dim=-1).cpu()
         result = {"pose_action": pose, "gripper_prob": gripper_prob, "terminate_prob": terminate_prob}
         if bins is not None:

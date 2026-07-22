@@ -219,8 +219,11 @@ def _build_fused_query_flow(cfg: dict):
             heads=int(pt.get("heads", 6)), attn_layers=int(pt.get("attn_layers", 2)),
         )
     fd = model_cfg.get("flow_dit", {}) or {}
+    # C35 optionally appends the binary gripper target to the continuous flow
+    # vector, following GR00T's joint-action formulation.
+    diffuse_gripper = bool(fd.get("diffuse_gripper", False))
     head = FlowMatchingDiTHead(
-        cond_dim=dim, action_dim=pose_dims, horizon=int(cfg.get("action", {}).get("chunk_size", 1)),
+        cond_dim=dim, action_dim=pose_dims + int(diffuse_gripper), horizon=int(cfg.get("action", {}).get("chunk_size", 1)),
         hidden_dim=int(fd.get("hidden_dim", 1024)), num_layers=int(fd.get("num_layers", 8)),
         heads=int(fd.get("heads", 16)), num_inference_steps=int(fd.get("num_inference_steps", 16)),
         dropout=float(fd.get("dropout", 0.1)), num_eval_samples=int(fd.get("num_eval_samples", 1)),
@@ -229,6 +232,7 @@ def _build_fused_query_flow(cfg: dict):
         noise_beta_beta=float(fd.get("noise_beta_beta", 1.0)), noise_s=float(fd.get("noise_s", 0.999)),
         vl_mixer_layers=int(fd.get("vl_mixer_layers", 4)),
         interleave_self_attention=bool(fd.get("interleave_self_attention", True)),
+        diffuse_gripper=diffuse_gripper,
     )
     model = FusedQueryFlowPolicy(
         vit, head, point_encoder, int(model_cfg["source_len"]),
@@ -249,7 +253,7 @@ def _build_fused_query_flow(cfg: dict):
     n_tr = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[fused_query_flow] total={sum(p.numel() for p in model.parameters())/1e6:.1f}M trainable={n_tr/1e6:.1f}M "
           f"head={sum(p.numel() for p in head.parameters())/1e6:.1f}M point_seq={point_seq} causal={causal_on} "
-          f"num_eval_samples={int(fd.get('num_eval_samples', 1))}")
+        f"num_eval_samples={int(fd.get('num_eval_samples', 1))} diffuse_gripper={diffuse_gripper}")
     return model
 
 

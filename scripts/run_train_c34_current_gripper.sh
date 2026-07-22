@@ -42,5 +42,5 @@ if [[ "$WRIST_COUNT" -ne 43415 ]]; then
 fi
 echo "C34 wrist frame caches: $WRIST_COUNT / 43415"
 
-exec bash scripts/run_distributed_train.sh \
-  configs/droidexFULL_C34_current_gripper_fulltrain.yaml "$@"
+CONFIG="${CONFIG:-configs/droidexFULL_C34_current_gripper_fulltrain.yaml}"
+exec bash scripts/run_distributed_train.sh "$CONFIG" "$@"
