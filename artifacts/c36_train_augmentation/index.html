@@ -1,0 +1,174 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>C36 training image augmentation</title>
+<style>body{font:15px sans-serif;margin:24px;background:#f5f5f5;color:#111}
+img{max-width:100%;height:auto;background:white;border:1px solid #bbb}
+pre{background:white;padding:16px;overflow:auto;border:1px solid #ccc} h2{margin-top:32px}</style>
+</head><body><h1>C36 training image augmentation</h1><pre>{
+  &quot;config&quot;: &quot;/mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/configs/droidexFULL_C36_no_frontdepth_diffuse_gripper_fulltrain.yaml&quot;,
+  &quot;episode_id&quot;: &quot;00122&quot;,
+  &quot;requested_start_index&quot;: 30,
+  &quot;actual_start_index&quot;: 30,
+  &quot;target_step&quot;: 30,
+  &quot;seeds&quot;: [
+    0,
+    1,
+    2,
+    3
+  ],
+  &quot;augmentation&quot;: {
+    &quot;enabled&quot;: true,
+    &quot;p&quot;: 1.0,
+    &quot;brightness&quot;: 0.1,
+    &quot;contrast&quot;: 0.1,
+    &quot;saturation&quot;: 0.05,
+    &quot;noise_std&quot;: 0.01
+  },
+  &quot;structural_augmentation&quot;: null,
+  &quot;note&quot;: &quot;Each stream uses the repository&#x27;s real apply_image_augmentation function.&quot;,
+  &quot;streams&quot;: {
+    &quot;source&quot;: {
+      &quot;shape&quot;: [
+        8,
+        3,
+        224,
+        224
+      ],
+      &quot;original_pixel_mean&quot;: 0.4709278643131256,
+      &quot;original_pixel_std&quot;: 0.2637499272823334,
+      &quot;variants&quot;: {
+        &quot;0&quot;: {
+          &quot;mean_abs_pixel_delta&quot;: 0.013580048456788063,
+          &quot;rms_pixel_delta&quot;: 0.016437653452157974,
+          &quot;max_abs_pixel_delta&quot;: 0.06610387563705444,
+          &quot;augmented_pixel_mean&quot;: 0.46973350644111633,
+          &quot;augmented_pixel_std&quot;: 0.27677595615386963,
+          &quot;fraction_clipped_low&quot;: 0.0029047750867903233,
+          &quot;fraction_clipped_high&quot;: 0.03878680244088173
+        },
+        &quot;1&quot;: {
+          &quot;mean_abs_pixel_delta&quot;: 0.0509326308965683,
+          &quot;rms_pixel_delta&quot;: 0.05347520112991333,
+          &quot;max_abs_pixel_delta&quot;: 0.11546852439641953,
+          &quot;augmented_pixel_mean&quot;: 0.5218595862388611,
+          &quot;augmented_pixel_std&quot;: 0.25113898515701294,
+          &quot;fraction_clipped_low&quot;: 0.0,
+          &quot;fraction_clipped_high&quot;: 0.04453324154019356
+        },
+        &quot;2&quot;: {
+          &quot;mean_abs_pixel_delta&quot;: 0.02309459075331688,
+          &quot;rms_pixel_delta&quot;: 0.025721946731209755,
+          &quot;max_abs_pixel_delta&quot;: 0.07923054695129395,
+          &quot;augmented_pixel_mean&quot;: 0.49377867579460144,
+          &quot;augmented_pixel_std&quot;: 0.25758203864097595,
+          &quot;fraction_clipped_low&quot;: 0.0,
+          &quot;fraction_clipped_high&quot;: 0.01235235296189785
+        },
+        &quot;3&quot;: {
+          &quot;mean_abs_pixel_delta&quot;: 0.09847401827573776,
+          &quot;rms_pixel_delta&quot;: 0.10146965086460114,
+          &quot;max_abs_pixel_delta&quot;: 0.17899686098098755,
+          &quot;augmented_pixel_mean&quot;: 0.37245386838912964,
+          &quot;augmented_pixel_std&quot;: 0.24198216199874878,
+          &quot;fraction_clipped_low&quot;: 0.03101416304707527,
+          &quot;fraction_clipped_high&quot;: 0.0
+        }
+      }
+    },
+    &quot;front_history&quot;: {
+      &quot;shape&quot;: [
+        3,
+        3,
+        224,
+        224
+      ],
+      &quot;original_pixel_mean&quot;: 0.47225895524024963,
+      &quot;original_pixel_std&quot;: 0.2647179067134857,
+      &quot;variants&quot;: {
+        &quot;0&quot;: {
+          &quot;mean_abs_pixel_delta&quot;: 0.030737005174160004,
+          &quot;rms_pixel_delta&quot;: 0.03358955681324005,
+          &quot;max_abs_pixel_delta&quot;: 0.0811602771282196,
+          &quot;augmented_pixel_mean&quot;: 0.4416569769382477,
+          &quot;augmented_pixel_std&quot;: 0.274330735206604,
+          &quot;fraction_clipped_low&quot;: 0.013674089685082436,
+          &quot;fraction_clipped_high&quot;: 0.000360951671609655
+        },
+        &quot;1&quot;: {
+          &quot;mean_abs_pixel_delta&quot;: 0.08668184280395508,
+          &quot;rms_pixel_delta&quot;: 0.09036608785390854,
+          &quot;max_abs_pixel_delta&quot;: 0.15849784016609192,
+          &quot;augmented_pixel_mean&quot;: 0.5589407682418823,
+          &quot;augmented_pixel_std&quot;: 0.24237002432346344,
+          &quot;fraction_clipped_low&quot;: 0.0,
+          &quot;fraction_clipped_high&quot;: 0.07406816631555557
+        },
+        &quot;2&quot;: {
+          &quot;mean_abs_pixel_delta&quot;: 0.07202513515949249,
+          &quot;rms_pixel_delta&quot;: 0.0760449767112732,
+          &quot;max_abs_pixel_delta&quot;: 0.1487661600112915,
+          &quot;augmented_pixel_mean&quot;: 0.5442840456962585,
+          &quot;augmented_pixel_std&quot;: 0.27272704243659973,
+          &quot;fraction_clipped_low&quot;: 0.0,
+          &quot;fraction_clipped_high&quot;: 0.10375256836414337
+        },
+        &quot;3&quot;: {
+          &quot;mean_abs_pixel_delta&quot;: 0.0680074468255043,
+          &quot;rms_pixel_delta&quot;: 0.07142969220876694,
+          &quot;max_abs_pixel_delta&quot;: 0.1402575969696045,
+          &quot;augmented_pixel_mean&quot;: 0.5402663946151733,
+          &quot;augmented_pixel_std&quot;: 0.2711086571216583,
+          &quot;fraction_clipped_low&quot;: 0.0,
+          &quot;fraction_clipped_high&quot;: 0.09967580437660217
+        }
+      }
+    },
+    &quot;wrist_history&quot;: {
+      &quot;shape&quot;: [
+        3,
+        3,
+        224,
+        224
+      ],
+      &quot;original_pixel_mean&quot;: 0.5007414817810059,
+      &quot;original_pixel_std&quot;: 0.29430583119392395,
+      &quot;variants&quot;: {
+        &quot;0&quot;: {
+          &quot;mean_abs_pixel_delta&quot;: 0.04074566438794136,
+          &quot;rms_pixel_delta&quot;: 0.047285910695791245,
+          &quot;max_abs_pixel_delta&quot;: 0.11190557479858398,
+          &quot;augmented_pixel_mean&quot;: 0.5401760935783386,
+          &quot;augmented_pixel_std&quot;: 0.31859686970710754,
+          &quot;fraction_clipped_low&quot;: 0.038285236805677414,
+          &quot;fraction_clipped_high&quot;: 0.0016253897920250893
+        },
+        &quot;1&quot;: {
+          &quot;mean_abs_pixel_delta&quot;: 0.02046739123761654,
+          &quot;rms_pixel_delta&quot;: 0.02380317635834217,
+          &quot;max_abs_pixel_delta&quot;: 0.07881665229797363,
+          &quot;augmented_pixel_mean&quot;: 0.5121480822563171,
+          &quot;augmented_pixel_std&quot;: 0.3122852146625519,
+          &quot;fraction_clipped_low&quot;: 0.1132967546582222,
+          &quot;fraction_clipped_high&quot;: 0.00021037060650996864
+        },
+        &quot;2&quot;: {
+          &quot;mean_abs_pixel_delta&quot;: 0.03830890357494354,
+          &quot;rms_pixel_delta&quot;: 0.044279322028160095,
+          &quot;max_abs_pixel_delta&quot;: 0.10802727937698364,
+          &quot;augmented_pixel_mean&quot;: 0.46659785509109497,
+          &quot;augmented_pixel_std&quot;: 0.26814892888069153,
+          &quot;fraction_clipped_low&quot;: 0.008330675773322582,
+          &quot;fraction_clipped_high&quot;: 0.0
+        },
+        &quot;3&quot;: {
+          &quot;mean_abs_pixel_delta&quot;: 0.05394209548830986,
+          &quot;rms_pixel_delta&quot;: 0.05761214345693588,
+          &quot;max_abs_pixel_delta&quot;: 0.1250244677066803,
+          &quot;augmented_pixel_mean&quot;: 0.4467993974685669,
+          &quot;augmented_pixel_std&quot;: 0.286164790391922,
+          &quot;fraction_clipped_low&quot;: 0.18023446202278137,
+          &quot;fraction_clipped_high&quot;: 0.0
+        }
+      }
+    }
+  }
+}</pre><h2>00122_start00030_source_overview.png</h2><a href="00122_start00030_source_overview.png"><img src="00122_start00030_source_overview.png" loading="lazy"></a><h2>00122_start00030_source_seed0_detail.png</h2><a href="00122_start00030_source_seed0_detail.png"><img src="00122_start00030_source_seed0_detail.png" loading="lazy"></a><h2>00122_start00030_source_seed1_detail.png</h2><a href="00122_start00030_source_seed1_detail.png"><img src="00122_start00030_source_seed1_detail.png" loading="lazy"></a><h2>00122_start00030_source_seed2_detail.png</h2><a href="00122_start00030_source_seed2_detail.png"><img src="00122_start00030_source_seed2_detail.png" loading="lazy"></a><h2>00122_start00030_source_seed3_detail.png</h2><a href="00122_start00030_source_seed3_detail.png"><img src="00122_start00030_source_seed3_detail.png" loading="lazy"></a><h2>00122_start00030_front_history_overview.png</h2><a href="00122_start00030_front_history_overview.png"><img src="00122_start00030_front_history_overview.png" loading="lazy"></a><h2>00122_start00030_front_history_seed0_detail.png</h2><a href="00122_start00030_front_history_seed0_detail.png"><img src="00122_start00030_front_history_seed0_detail.png" loading="lazy"></a><h2>00122_start00030_front_history_seed1_detail.png</h2><a href="00122_start00030_front_history_seed1_detail.png"><img src="00122_start00030_front_history_seed1_detail.png" loading="lazy"></a><h2>00122_start00030_front_history_seed2_detail.png</h2><a href="00122_start00030_front_history_seed2_detail.png"><img src="00122_start00030_front_history_seed2_detail.png" loading="lazy"></a><h2>00122_start00030_front_history_seed3_detail.png</h2><a href="00122_start00030_front_history_seed3_detail.png"><img src="00122_start00030_front_history_seed3_detail.png" loading="lazy"></a><h2>00122_start00030_wrist_history_overview.png</h2><a href="00122_start00030_wrist_history_overview.png"><img src="00122_start00030_wrist_history_overview.png" loading="lazy"></a><h2>00122_start00030_wrist_history_seed0_detail.png</h2><a href="00122_start00030_wrist_history_seed0_detail.png"><img src="00122_start00030_wrist_history_seed0_detail.png" loading="lazy"></a><h2>00122_start00030_wrist_history_seed1_detail.png</h2><a href="00122_start00030_wrist_history_seed1_detail.png"><img src="00122_start00030_wrist_history_seed1_detail.png" loading="lazy"></a><h2>00122_start00030_wrist_history_seed2_detail.png</h2><a href="00122_start00030_wrist_history_seed2_detail.png"><img src="00122_start00030_wrist_history_seed2_detail.png" loading="lazy"></a><h2>00122_start00030_wrist_history_seed3_detail.png</h2><a href="00122_start00030_wrist_history_seed3_detail.png"><img src="00122_start00030_wrist_history_seed3_detail.png" loading="lazy"></a></body></html>

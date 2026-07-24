@@ -1309,3 +1309,75 @@ XYZ MAE **1.855→1.672 cm（-9.9%）**，dx/dy corr 微升。ODE 积分更细 +
 - **初始化/训练**: 从C33 ep10 `latest.pt` weights-only warm start；`ee_mlp`前三维权重前缀复制，新增夹爪维度随机初始化；其余模型、历史RGB、当前depth、loss和训练超参保持C33不变，训练10 epoch、主LR `3e-5`、每卡batch 12。
 - **预处理**: 新增clip的原始腕部视频全部存在，但需先执行`START_ID=35696 END_ID=43415 WORKERS=16 bash scripts/run_preprocess_wrist_frames.sh`生成缓存。新增clip已有6847/7719条FoundationStereo geometry；缺失条目按invalid geometry处理，仍纳入训练。
 - **配置与入口**: `configs/droidexFULL_C34_current_gripper_fulltrain.yaml`；训练`bash scripts/run_train_c34_current_gripper.sh`；正式评估`bash scripts/run_eval_c34_current_gripper.sh <checkpoint>`。
+
+## Exp C35/C36 — gripper 进入 joint flow，以及去除当前深度  ✅
+
+- **C35**: 在C34基础上把gripper作为第10个连续flow action维度（`diffuse_gripper: true`），不再输入当前gripper状态；保持8个动作点、相邻间隔5帧（15Hz数据上的`+5,...,+40`），预测覆盖2.67s。训练10 epoch，`latest.pt`=ep10。
+- **C36**: C35的无深度消融；关闭FoundationStereo patch geometry，保持8帧source、front/wrist三帧历史、3D camera-projection proprioception和全部其他训练设置。训练10 epoch，`latest.pt`=ep10。
+- **训练内置val（ep10，非正式采样评估）**:
+
+  | 指标 | C35 | C36 | C36-C35 |
+  |---|---:|---:|---:|
+  | pose MAE | 0.031551 | **0.031426** | -0.4% |
+  | pose RMSE | 0.060324 | **0.060026** | -0.5% |
+  | joint val MSE | 0.027621 | **0.027045** | -2.1% |
+  | gripper MSE | 0.220900 | **0.215618** | -2.4% |
+  | gripper accuracy | 0.9347 | **0.9376** | +0.29pp |
+  | gripper Brier | 0.055205 | **0.053790** | -2.7% |
+
+- **结论（训练内置val）**: 去掉当前front depth没有退化，C36各项略优；差距很小，不能仅据此声称深度有害，需用正式采样评估与event-aware诊断判断。
+
+### C35/C36 event-aware frozen-val诊断（正式，32 flow steps / 16 samples / seed=0）
+
+- **事件定义**: 原始15Hz gripper `>0.5 -> <=0.5`为close，反向为release。C35/C36 chunk预测于`+5,+10,...,+40`帧；cover窗口定义为事件落在`(current,current+40]`。共有3235个事件邻域窗口：close cover=426、release cover=1168；close/release分别有178/385个独立时序事件。
+- **指标定义**: close以closed为positive，release以open为positive；时序MAE只统计检测到切换的独立事件，miss rate单列；有符号平均偏差为正表示预测偏晚。
+
+  | 模型/事件 | Precision | Recall | 漏切换率 | 时序 MAE | 平均偏差 | cover窗口 XYZ: 转折前→后 |
+  |---|---:|---:|---:|---:|---:|---:|
+  | C35 close | 0.838 | 0.800 | 6.7% | 6.42帧 / 428ms | 晚3.31帧 | 1.332→2.107cm |
+  | C36 close | 0.837 | 0.808 | 6.7% | 6.26帧 / 417ms | 晚3.09帧 | 1.339→2.121cm |
+  | C35 release | 0.937 | 0.881 | 6.8% | 3.42帧 / 228ms | 晚2.94帧 | 0.857→1.216cm |
+  | C36 release | 0.944 | 0.882 | 6.2% | 3.67帧 / 245ms | 晚3.28帧 | 0.859→1.214cm |
+
+- **结论**: close比release困难得多。转折前的close XYZ约1.33cm，并非首先恶化；close后升至约2.11cm。更先出现的是gripper时机问题：close recall约0.80且系统性晚约3帧。C35/C36事件指标几乎相同，当前depth没有解决该问题。
+- **产物**: `outputs/event_aware_c35_c36_eval32_seed0/event_aware_report.{md,json}`。
+
+## Exp C37 — 15Hz dense 15-step chunk + current gripper + single flow sample  ✅
+
+- **目的**: 针对C35/C36的5帧（333ms）gripper时间分辨率和多sample平均可能模糊切换时刻的问题，改为Pi0.5风格的连续15Hz动作序列。
+- **相对C36的变化**:
+  1. `future_horizon: 5 -> 1`；`chunk_size: 8 -> 15`，预测`+1,...,+15`帧，覆盖1.0s。
+  2. 重新输入当前二值gripper，proprioception `3D -> 4D`。
+  3. `num_eval_samples: 16 -> 1`；正式推理仍为32个ODE/flow integration steps（后者不是控制频率）。
+  4. 保持无front depth、8帧source、front/wrist历史和训练锚点`action_stride=10`不变；从C36 ep10 weights-only warm start，新增15-step位置/aux头与当前gripper输入维随机初始化，fresh optimizer，训练10 epoch。
+- **训练完成**: `latest.pt`=ep10；训练内置val在ep9达到最低action MAE/RMSE（0.019837 / 0.039793），ep10为0.020220 / 0.040583；ep10 gripper acc=0.9600、Brier=0.03986。
+
+### C37 正式action评估（frozen val前800 windows，32 flow steps / 1 sample / seed=0）
+
+  | 指标 | C37 ep10 latest |
+  |---|---:|
+  | XYZ MAE | **0.945cm** |
+  | dx / dy / dz MAE | 0.794 / 1.011 / 1.031cm |
+  | dx / dy / dz corr | 0.906 / 0.878 / 0.866 |
+  | gripper accuracy / Brier | 0.9746 / 0.0254 |
+  | XYZ均值基线 | 1.960cm（胜51.8%） |
+  | `+67ms` / `+333ms` / `+1.0s` XYZ MAE | 0.13 / 0.69 / 1.49cm |
+
+- **注意**: C37与C35/C36预测的时域不同（1.0s vs 2.67s），整体XYZ MAE不可视为同一预测目标上的直接胜负；应重点看相同时间附近的per-step结果及事件时序。
+- **正式日志**: `outputs/droidexFULL_C37_dense15_current_gripper_singleflow_fulltrain/eval32_single_800w_seed0.log`。
+
+### C37 event-aware frozen-val诊断（正式，32 flow steps / 1 sample / seed=0）
+
+- **口径**: 与C35/C36相同的原始15Hz事件定义和precision/recall/timing/XYZ计算方式，但C37 cover horizon为`(current,current+15]`，即1秒。共2307个事件邻域窗口：close cover=285、release cover=579；close/release分别有212/399个独立时序事件。
+
+  | 模型/事件 | Precision | Recall | 漏切换率 | 时序 MAE | 平均偏差 | cover窗口 XYZ: 转折前→后 |
+  |---|---:|---:|---:|---:|---:|---:|
+  | C37 close | 0.891 | 0.704 | 16.5% | 2.16帧 / 144ms | 晚0.83帧 | 0.754→1.349cm |
+  | C37 release | 0.930 | 0.811 | 8.8% | 1.21帧 / 81ms | 晚0.51帧 | 0.399→0.663cm |
+
+- **结论**:
+  1. 对于成功检测到的事件，dense 15Hz输出显著降低时序误差和系统性滞后：close从C35的428ms/晚3.31帧降至144ms/晚0.83帧；release从228ms/晚2.94帧降至81ms/晚0.51帧。
+  2. 转折邻域XYZ也明显降低；C37 close和release的事件前/后误差分别为0.754→1.349cm和0.399→0.663cm。
+  3. 代价是close漏切换率提高至16.5%、cover recall降至0.704；C37对已经做出的切换时刻更准，但在其1秒窗口内更常完全不预测close。
+  4. C37的1秒window与C35/C36的2.67秒window覆盖范围不同，不能把窗口数、recall或miss rate当作无条件公平的横向比较；时序量化改善是可靠信号，close漏检则是下一步需专门处理的问题。
+- **产物**: `outputs/droidexFULL_C37_dense15_current_gripper_singleflow_fulltrain/event_aware_eval32_single_seed0/event_aware_report.{md,json}`。

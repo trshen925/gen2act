@@ -1,0 +1,30 @@
+# C37: C36 with Pi0.5-DROID-style dense action timing.
+# Predict 15 consecutive 15 Hz actions at t+1, ..., t+15 (one second),
+# condition on the current binary gripper state, and use one flow sample at eval.
+_base_: droidexFULL_C36_no_frontdepth_diffuse_gripper_fulltrain.yaml
+
+experiment:
+  name: droidexFULL_C37_dense15_current_gripper_singleflow_fulltrain
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidexFULL_C37_dense15_current_gripper_singleflow_fulltrain
+
+data:
+  # Inter-action spacing inside the predicted chunk: one original DROID frame.
+  future_horizon: 1
+  proprioception:
+    append_current_gripper: true
+
+action:
+  # 15 actions x 1 frame at 15 Hz = one second of future control.
+  chunk_size: 15
+
+model:
+  proprioception_dim: 4
+  flow_dit:
+    num_eval_samples: 1
+
+train:
+  # Weights-only warm start: the optimizer is intentionally rebuilt. The first
+  # eight action-position embeddings transfer; positions 9-15 start randomly.
+  resume_checkpoint: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidexFULL_C36_no_frontdepth_diffuse_gripper_fulltrain/latest.pt
+  resume_full_checkpoint: null
+

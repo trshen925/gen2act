@@ -1,0 +1,169 @@
+{
+  "config": "/mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/configs/droidexFULL_C36_no_frontdepth_diffuse_gripper_fulltrain.yaml",
+  "episode_id": "00122",
+  "requested_start_index": 30,
+  "actual_start_index": 30,
+  "target_step": 30,
+  "seeds": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "augmentation": {
+    "enabled": true,
+    "p": 1.0,
+    "brightness": 0.1,
+    "contrast": 0.1,
+    "saturation": 0.05,
+    "noise_std": 0.01
+  },
+  "structural_augmentation": null,
+  "note": "Each stream uses the repository's real apply_image_augmentation function.",
+  "streams": {
+    "source": {
+      "shape": [
+        8,
+        3,
+        224,
+        224
+      ],
+      "original_pixel_mean": 0.4709278643131256,
+      "original_pixel_std": 0.2637499272823334,
+      "variants": {
+        "0": {
+          "mean_abs_pixel_delta": 0.013580048456788063,
+          "rms_pixel_delta": 0.016437653452157974,
+          "max_abs_pixel_delta": 0.06610387563705444,
+          "augmented_pixel_mean": 0.46973350644111633,
+          "augmented_pixel_std": 0.27677595615386963,
+          "fraction_clipped_low": 0.0029047750867903233,
+          "fraction_clipped_high": 0.03878680244088173
+        },
+        "1": {
+          "mean_abs_pixel_delta": 0.0509326308965683,
+          "rms_pixel_delta": 0.05347520112991333,
+          "max_abs_pixel_delta": 0.11546852439641953,
+          "augmented_pixel_mean": 0.5218595862388611,
+          "augmented_pixel_std": 0.25113898515701294,
+          "fraction_clipped_low": 0.0,
+          "fraction_clipped_high": 0.04453324154019356
+        },
+        "2": {
+          "mean_abs_pixel_delta": 0.02309459075331688,
+          "rms_pixel_delta": 0.025721946731209755,
+          "max_abs_pixel_delta": 0.07923054695129395,
+          "augmented_pixel_mean": 0.49377867579460144,
+          "augmented_pixel_std": 0.25758203864097595,
+          "fraction_clipped_low": 0.0,
+          "fraction_clipped_high": 0.01235235296189785
+        },
+        "3": {
+          "mean_abs_pixel_delta": 0.09847401827573776,
+          "rms_pixel_delta": 0.10146965086460114,
+          "max_abs_pixel_delta": 0.17899686098098755,
+          "augmented_pixel_mean": 0.37245386838912964,
+          "augmented_pixel_std": 0.24198216199874878,
+          "fraction_clipped_low": 0.03101416304707527,
+          "fraction_clipped_high": 0.0
+        }
+      }
+    },
+    "front_history": {
+      "shape": [
+        3,
+        3,
+        224,
+        224
+      ],
+      "original_pixel_mean": 0.47225895524024963,
+      "original_pixel_std": 0.2647179067134857,
+      "variants": {
+        "0": {
+          "mean_abs_pixel_delta": 0.030737005174160004,
+          "rms_pixel_delta": 0.03358955681324005,
+          "max_abs_pixel_delta": 0.0811602771282196,
+          "augmented_pixel_mean": 0.4416569769382477,
+          "augmented_pixel_std": 0.274330735206604,
+          "fraction_clipped_low": 0.013674089685082436,
+          "fraction_clipped_high": 0.000360951671609655
+        },
+        "1": {
+          "mean_abs_pixel_delta": 0.08668184280395508,
+          "rms_pixel_delta": 0.09036608785390854,
+          "max_abs_pixel_delta": 0.15849784016609192,
+          "augmented_pixel_mean": 0.5589407682418823,
+          "augmented_pixel_std": 0.24237002432346344,
+          "fraction_clipped_low": 0.0,
+          "fraction_clipped_high": 0.07406816631555557
+        },
+        "2": {
+          "mean_abs_pixel_delta": 0.07202513515949249,
+          "rms_pixel_delta": 0.0760449767112732,
+          "max_abs_pixel_delta": 0.1487661600112915,
+          "augmented_pixel_mean": 0.5442840456962585,
+          "augmented_pixel_std": 0.27272704243659973,
+          "fraction_clipped_low": 0.0,
+          "fraction_clipped_high": 0.10375256836414337
+        },
+        "3": {
+          "mean_abs_pixel_delta": 0.0680074468255043,
+          "rms_pixel_delta": 0.07142969220876694,
+          "max_abs_pixel_delta": 0.1402575969696045,
+          "augmented_pixel_mean": 0.5402663946151733,
+          "augmented_pixel_std": 0.2711086571216583,
+          "fraction_clipped_low": 0.0,
+          "fraction_clipped_high": 0.09967580437660217
+        }
+      }
+    },
+    "wrist_history": {
+      "shape": [
+        3,
+        3,
+        224,
+        224
+      ],
+      "original_pixel_mean": 0.5007414817810059,
+      "original_pixel_std": 0.29430583119392395,
+      "variants": {
+        "0": {
+          "mean_abs_pixel_delta": 0.04074566438794136,
+          "rms_pixel_delta": 0.047285910695791245,
+          "max_abs_pixel_delta": 0.11190557479858398,
+          "augmented_pixel_mean": 0.5401760935783386,
+          "augmented_pixel_std": 0.31859686970710754,
+          "fraction_clipped_low": 0.038285236805677414,
+          "fraction_clipped_high": 0.0016253897920250893
+        },
+        "1": {
+          "mean_abs_pixel_delta": 0.02046739123761654,
+          "rms_pixel_delta": 0.02380317635834217,
+          "max_abs_pixel_delta": 0.07881665229797363,
+          "augmented_pixel_mean": 0.5121480822563171,
+          "augmented_pixel_std": 0.3122852146625519,
+          "fraction_clipped_low": 0.1132967546582222,
+          "fraction_clipped_high": 0.00021037060650996864
+        },
+        "2": {
+          "mean_abs_pixel_delta": 0.03830890357494354,
+          "rms_pixel_delta": 0.044279322028160095,
+          "max_abs_pixel_delta": 0.10802727937698364,
+          "augmented_pixel_mean": 0.46659785509109497,
+          "augmented_pixel_std": 0.26814892888069153,
+          "fraction_clipped_low": 0.008330675773322582,
+          "fraction_clipped_high": 0.0
+        },
+        "3": {
+          "mean_abs_pixel_delta": 0.05394209548830986,
+          "rms_pixel_delta": 0.05761214345693588,
+          "max_abs_pixel_delta": 0.1250244677066803,
+          "augmented_pixel_mean": 0.4467993974685669,
+          "augmented_pixel_std": 0.286164790391922,
+          "fraction_clipped_low": 0.18023446202278137,
+          "fraction_clipped_high": 0.0
+        }
+      }
+    }
+  }
+}
