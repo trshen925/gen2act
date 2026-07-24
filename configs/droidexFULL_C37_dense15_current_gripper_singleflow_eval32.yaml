@@ -1,0 +1,11 @@
+_base_: droidexFULL_C37_dense15_current_gripper_singleflow_fulltrain.yaml
+
+model:
+  flow_dit:
+    num_inference_steps: 32
+    num_eval_samples: 1
+
+train:
+  batch_size: 32
+  num_workers: 4
+

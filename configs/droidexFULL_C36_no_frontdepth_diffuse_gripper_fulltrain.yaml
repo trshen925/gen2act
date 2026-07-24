@@ -1,0 +1,16 @@
+# C36: C35 joint pose+gripper flow policy without FoundationStereo patch geometry.
+# Keep C35's C33 initialization and all RGB/history inputs so depth is the only
+# removed condition.
+_base_: droidexFULL_C35_diffuse_gripper_fulltrain.yaml
+
+experiment:
+  name: droidexFULL_C36_no_frontdepth_diffuse_gripper_fulltrain
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidexFULL_C36_no_frontdepth_diffuse_gripper_fulltrain
+
+data:
+  depth:
+    enabled: false
+
+model:
+  front_depth:
+    enabled: false
