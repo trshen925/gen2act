@@ -11,7 +11,11 @@ from torch.utils.data import Dataset
 
 from r2r_gen2act.data.episode_index import build_windows
 from r2r_gen2act.data.overlay import draw_trajectory, raw_to_display_px
-from r2r_gen2act.data.transforms import apply_image_augmentation, apply_structural_augmentation, image_to_tensor
+from r2r_gen2act.data.transforms import (
+    apply_image_augmentation, apply_sampled_image_augmentation,
+    apply_structural_augmentation, image_to_letterbox_tensor, image_to_tensor,
+    sample_image_augmentation, translate_image_reflect,
+)
 from r2r_gen2act.data.types import EpisodeRecord
 
 
@@ -113,6 +117,7 @@ class WindowedRobotDataset(Dataset):
         self.wrist_frames_subdir = str(wrist_cfg.get("frames_subdir", "wrist_frames"))
         self.wrist_frames_ext = str(wrist_cfg.get("frames_ext", "jpg"))
         self.wrist_allow_video_fallback = bool(wrist_cfg.get("allow_video_fallback", False))
+        self.wrist_letterbox = bool(wrist_cfg.get("letterbox", False))
         # C33: fixed recent observations in clip-frame units. Keep target_history_len=1
         # so the action target remains at the current frame rather than shifting it.
         history_offsets = self.data_cfg.get("current_history_offsets", [0])
@@ -134,6 +139,8 @@ class WindowedRobotDataset(Dataset):
         self.depth_ext = str(depth_cfg.get("frames_ext", "png"))
         self.source_jitter_cfg = self.data_cfg.get("source_jitter", {})
         self.augmentation_cfg = self.data_cfg.get("augmentation", {})
+        self.front_translation_cfg = self.data_cfg.get("front_translation", {})
+        self.front_translation_enabled = bool(self.front_translation_cfg.get("enabled", False))
         # C10: EE-targeted structural augmentation to simulate generated-video gripper gap.
         self.struct_aug_cfg = self.data_cfg.get("structural_augmentation", {})
         self.struct_aug_enabled = bool(self.struct_aug_cfg.get("enabled", False))
@@ -465,7 +472,9 @@ class WindowedRobotDataset(Dataset):
         cache_dir = Path(episode.metadata_path).parent / self.wrist_frames_subdir
         cached = cache_dir / f"{target_step:06d}.{self.wrist_frames_ext}"
         if cached.exists():
-            return image_to_tensor(imageio.imread(str(cached)), self.image_size)
+            image = imageio.imread(str(cached))
+            return (image_to_letterbox_tensor(image, self.image_size)
+                    if self.wrist_letterbox else image_to_tensor(image, self.image_size))
         if not self.wrist_allow_video_fallback:
             raise FileNotFoundError(
                 f"Missing wrist cache frame {cached}; run scripts/preprocess_wrist_frames.py first")
@@ -473,7 +482,22 @@ class WindowedRobotDataset(Dataset):
         if not wrist_video.exists():
             raise FileNotFoundError(f"Missing raw wrist video for {episode.episode_id}: {wrist_video}")
         raw_idx = int(episode.extra.get("source_frame_start", 0)) + target_step
-        return self._read_video_indices(wrist_video, [raw_idx])[0]
+        reader = self._reader(wrist_video)
+        image = reader.get_data(raw_idx)
+        return (image_to_letterbox_tensor(image, self.image_size)
+                if self.wrist_letterbox else image_to_tensor(image, self.image_size))
+
+    def _read_front_with_translation(self, episode: EpisodeRecord, indices: list[int], dx_frac: float, dy_frac: float) -> torch.Tensor:
+        """Read native front frames, apply one shared translation, then standard C37 preprocessing."""
+        path = episode.target_video_path
+        assert path is not None
+        reader = self._reader(path)
+        length = self._video_length(reader)
+        frames = []
+        for index in indices:
+            index = min(max(0, int(index)), length - 1) if length > 0 else int(index)
+            frames.append(image_to_tensor(translate_image_reflect(reader.get_data(index), dx_frac, dy_frac), self.image_size))
+        return torch.stack(frames, dim=0)
 
     def _read_wrist_history(self, episode: EpisodeRecord, target_step: int) -> torch.Tensor:
         """Read wrist observations aligned to ``current_history_offsets``."""
@@ -493,6 +517,19 @@ class WindowedRobotDataset(Dataset):
         if high <= low:
             return int(start_index)
         return int(torch.randint(low, high + 1, ()).item())
+
+    def _translate_model_projection(self, projection: np.ndarray, payload: dict, dx_frac: float, dy_frac: float) -> np.ndarray:
+        """Move model-input EE coordinates by a native-frame translation."""
+        if not self.front_translation_enabled or str(self.proprioception_cfg.get("projection_image_space", "original")) != "model_input":
+            return projection
+        raw_h, raw_w = [int(x) for x in payload["image_shape"][:2]]
+        scale = self.image_size / float(min(raw_h, raw_w))
+        dx_model = float(dx_frac) * raw_w * scale
+        dy_model = float(dy_frac) * raw_h * scale
+        out = np.asarray(projection, dtype=np.float32).copy()
+        out[0] += 2.0 * dx_model / max(1.0, self.image_size - 1.0)
+        out[1] += 2.0 * dy_model / max(1.0, self.image_size - 1.0)
+        return out
 
     def sample_window(self, episode_id: str, start_index: int) -> dict:
         episode = self._episode_by_id[episode_id]
@@ -547,10 +584,24 @@ class WindowedRobotDataset(Dataset):
                 dt = np.zeros_like(idx_arr)
                 dt[1:] = np.diff(idx_arr) / max(1.0, float(self.fps))
                 sample["source_dt"] = torch.as_tensor(dt, dtype=torch.float32)  # [source_len]
-            target_history = self._read_target_history(episode, start_index)
+            front_dx = front_dy = 0.0
+            if self.split == "train" and self.front_translation_enabled:
+                max_x = float(self.front_translation_cfg.get("max_x_frac", 0.0))
+                max_y = float(self.front_translation_cfg.get("max_y_frac", 0.0))
+                front_dx = float((torch.rand(()) * 2.0 - 1.0) * max_x)
+                front_dy = float((torch.rand(()) * 2.0 - 1.0) * max_y)
+            if self.front_translation_enabled:
+                target_indices = [int(target_step) + offset for offset in self.current_history_offsets]
+                target_history = self._read_front_with_translation(episode, target_indices, front_dx, front_dy)
+                # Source demo frames are the same front camera and share this virtual principal-point shift.
+                source_video = self._read_front_with_translation(episode, _src_idx, front_dx, front_dy)
+            else:
+                target_history = self._read_target_history(episode, start_index)
             if self.split == "train":
-                source_video = apply_image_augmentation(source_video, self.augmentation_cfg)
-                target_history = apply_image_augmentation(target_history, self.augmentation_cfg)
+                source_aug = sample_image_augmentation(self.augmentation_cfg)
+                current_aug = sample_image_augmentation(self.augmentation_cfg)
+                source_video = apply_sampled_image_augmentation(source_video, source_aug)
+                target_history = apply_sampled_image_augmentation(target_history, current_aug)
                 if self.struct_aug_enabled:
                     # project future EE positions to 224×224 image coords for EE-targeted aug
                     cam_pos = action[:, :3] if action.ndim == 2 else None
@@ -562,13 +613,15 @@ class WindowedRobotDataset(Dataset):
             if self.wrist_current_enabled:
                 wrist_current = self._read_wrist_history(episode, target_step)
                 if self.split == "train":
-                    wrist_current = apply_image_augmentation(wrist_current, self.augmentation_cfg)
+                    wrist_current = apply_sampled_image_augmentation(wrist_current, current_aug)
                 sample["wrist_current"] = wrist_current
             if self.overlay_enabled:
                 # draw the demo EE path onto the current (last) frame AFTER augmentation (crisp path)
                 target_history[-1] = self._overlay_current_frame(target_history[-1], episode.episode_id, target_step)
         if self.proprioception_enabled:
             prop = np.asarray(self._proprioception_at(payload, start_index, target_step), dtype=np.float32).reshape(-1)
+            if self.split == "train" and self.front_translation_enabled:
+                prop = self._translate_model_projection(prop, payload, front_dx, front_dy)
             if self.proprioception_append_progress:
                 # normalized task progress (target_step / (num_steps-1)) in [0,1]: a coarse
                 # localization anchor telling the model "how far into the demo am I".

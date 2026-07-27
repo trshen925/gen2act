@@ -1,0 +1,30 @@
+# C38: C37 with single-frame current observations and geometry-aware visual augmentation.
+_base_: droidexFULL_C37_dense15_current_gripper_singleflow_fulltrain.yaml
+
+experiment:
+  name: droidexFULL_C38_singlecurrent_wristletterbox_fronttranslate_fulltrain
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidexFULL_C38_singlecurrent_wristletterbox_fronttranslate_fulltrain
+
+data:
+  window_jitter: {enabled: true, max_offset: 5}
+  current_history_offsets: [0]
+  augmentation:
+    enabled: true
+    p: 1.0
+    brightness: 0.30
+    contrast: 0.40
+    saturation: 0.50
+    noise_std: 0.0
+  front_translation:
+    enabled: true
+    max_x_frac: 0.10
+    max_y_frac: 0.10
+  wrist_current:
+    # Keep full wrist-camera context rather than cropping a 320x180 frame to its center square.
+    letterbox: true
+
+train:
+  # C38 drops the C37 history-time embeddings; all compatible weights warm-start.
+  resume_checkpoint: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidexFULL_C37_dense15_current_gripper_singleflow_fulltrain/latest.pt
+  resume_full_checkpoint: null
+  epochs: 15

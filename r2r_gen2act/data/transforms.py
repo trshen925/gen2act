@@ -7,6 +7,10 @@ from typing import Optional
 
 
 def image_to_tensor(image: np.ndarray, image_size: int) -> torch.Tensor:
+    return resize_center_crop(_image_to_chw(image), image_size)
+
+
+def _image_to_chw(image: np.ndarray) -> torch.Tensor:
     tensor = torch.as_tensor(image)
     if tensor.ndim == 2:
         tensor = tensor[:, :, None].expand(-1, -1, 3)
@@ -19,7 +23,64 @@ def image_to_tensor(image: np.ndarray, image_size: int) -> torch.Tensor:
     tensor = tensor.permute(2, 0, 1).contiguous().float()
     if tensor.numel() and tensor.max().item() > 1.5:
         tensor = tensor / 255.0
-    return resize_center_crop(tensor, image_size)
+    return tensor
+
+
+def image_to_letterbox_tensor(image: np.ndarray, image_size: int, fill: float = 0.0) -> torch.Tensor:
+    """Fit an RGB image into a square without crop or distortion."""
+    tensor = _image_to_chw(image)
+    h, w = tensor.shape[-2:]
+    scale = min(image_size / float(h), image_size / float(w))
+    new_h, new_w = int(round(h * scale)), int(round(w * scale))
+    resized = F.interpolate(tensor.unsqueeze(0), size=(new_h, new_w), mode="bilinear", align_corners=False).squeeze(0)
+    out = torch.full((resized.shape[0], image_size, image_size), float(fill), dtype=resized.dtype)
+    top, left = (image_size - new_h) // 2, (image_size - new_w) // 2
+    out[:, top:top + new_h, left:left + new_w] = resized
+    return out
+
+
+def translate_image_reflect(image: np.ndarray, frac_x: float, frac_y: float) -> np.ndarray:
+    """Translate a native HWC image by fractional width/height with reflection fill."""
+    tensor = _image_to_chw(image)
+    h, w = tensor.shape[-2:]
+    dx, dy = int(round(float(frac_x) * w)), int(round(float(frac_y) * h))
+    if dx == 0 and dy == 0:
+        return np.asarray(image)
+    padded = F.pad(tensor.unsqueeze(0), (abs(dx), abs(dx), abs(dy), abs(dy)), mode="reflect")
+    shifted = padded[..., abs(dy) - dy:abs(dy) - dy + h, abs(dx) - dx:abs(dx) - dx + w][0]
+    return shifted.permute(1, 2, 0).cpu().numpy()
+
+
+def sample_image_augmentation(cfg: dict) -> dict | None:
+    """Sample reusable clip-level photometric factors for synchronized cameras."""
+    if not bool(cfg.get("enabled", False)):
+        return None
+    if float(cfg.get("p", 1.0)) < 1.0 and torch.rand(()) > float(cfg.get("p", 1.0)):
+        return None
+    def factor(name: str) -> float:
+        strength = float(cfg.get(name, 0.0))
+        return 1.0 + float((torch.rand(()) * 2.0 - 1.0) * strength)
+    brightness = float(cfg.get("brightness", 0.0))
+    return {
+        "brightness_delta": float((torch.rand(()) * 2.0 - 1.0) * brightness),
+        "contrast_factor": factor("contrast"),
+        "saturation_factor": factor("saturation"),
+        "noise_std": float(cfg.get("noise_std", 0.0)),
+    }
+
+
+def apply_sampled_image_augmentation(video: torch.Tensor, sampled: dict | None) -> torch.Tensor:
+    if sampled is None:
+        return video
+    x = video + float(sampled["brightness_delta"])
+    mean = x.mean(dim=(-2, -1), keepdim=True)
+    x = (x - mean) * float(sampled["contrast_factor"]) + mean
+    gray = x.mean(dim=-3, keepdim=True)
+    x = (x - gray) * float(sampled["saturation_factor"]) + gray
+    noise_std = float(sampled["noise_std"])
+    if noise_std > 0:
+        x = x + torch.randn_like(x) * noise_std
+    return x.clamp_(0.0, 1.0)
 
 
 def resize_center_crop(tensor: torch.Tensor, image_size: int) -> torch.Tensor:
@@ -45,30 +106,7 @@ def apply_image_augmentation(video: torch.Tensor, cfg: dict) -> torch.Tensor:
     in one clip to avoid temporal flicker. No crop/flip/rotation is used because
     this project predicts robot actions in the original camera/action frame.
     """
-    if not bool(cfg.get("enabled", False)):
-        return video
-    p = float(cfg.get("p", 1.0))
-    if p < 1.0 and torch.rand(()) > p:
-        return video
-    x = video
-    brightness = float(cfg.get("brightness", 0.0))
-    contrast = float(cfg.get("contrast", 0.0))
-    saturation = float(cfg.get("saturation", 0.0))
-    noise_std = float(cfg.get("noise_std", 0.0))
-    if brightness > 0:
-        delta = (torch.rand((), dtype=x.dtype, device=x.device) * 2.0 - 1.0) * brightness
-        x = x + delta
-    if contrast > 0:
-        factor = 1.0 + (torch.rand((), dtype=x.dtype, device=x.device) * 2.0 - 1.0) * contrast
-        mean = x.mean(dim=(-2, -1), keepdim=True)
-        x = (x - mean) * factor + mean
-    if saturation > 0:
-        factor = 1.0 + (torch.rand((), dtype=x.dtype, device=x.device) * 2.0 - 1.0) * saturation
-        gray = x.mean(dim=-3, keepdim=True)
-        x = (x - gray) * factor + gray
-    if noise_std > 0:
-        x = x + torch.randn_like(x) * noise_std
-    return x.clamp_(0.0, 1.0)
+    return apply_sampled_image_augmentation(video, sample_image_augmentation(cfg))
 
 
 def _gaussian_kernel(sigma: float, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
