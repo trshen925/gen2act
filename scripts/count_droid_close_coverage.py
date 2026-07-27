@@ -23,6 +23,8 @@ VIEWS = {
     "exterior_image_2_left": "steps_observation_exterior_image_2_left.mp4",
 }
 KARLP_PATHS = Path("/mnt/pfs/data/shentingrui/KarlP-droid/episode_id_to_path.json")
+KARLP_SERIALS = Path("/mnt/pfs/data/shentingrui/KarlP-droid/camera_serials.json")
+KARLP_EXTRINSICS = Path("/mnt/pfs/data/shentingrui/KarlP-droid/cam2base_extrinsics.json")
 RAW_PATH_PREFIX = "gs://xembodiment_data/r2d2/r2d2-data-full/"
 
 
@@ -37,6 +39,11 @@ def main() -> None:
     started = time.time()
     with KARLP_PATHS.open("r", encoding="utf-8") as handle:
         episode_paths = json.load(handle)
+    with KARLP_SERIALS.open("r", encoding="utf-8") as handle:
+        camera_serials = json.load(handle)
+    with KARLP_EXTRINSICS.open("r", encoding="utf-8") as handle:
+        cam2base = json.load(handle)
+    path_to_episode_id = {str(path): episode_id for episode_id, path in episode_paths.items()}
     # Unique DROID episode identity + camera -> source-frame intervals retained by output clips.
     retained: dict[tuple[str, str], list[tuple[int, int]]] = defaultdict(list)
     identity_cache: dict[str, str] = {}
@@ -65,17 +72,27 @@ def main() -> None:
 
     raw = Counter()
     for index, episode in enumerate(sorted(RAW_ROOT.glob("episode_*")), 1):
-        views = [view for view, filename in VIEWS.items() if (episode / filename).is_file()]
-        if not views:
-            raw["no_front_video"] += 1
-            continue
         try:
+            with (episode / "metadata.json").open("r", encoding="utf-8") as handle:
+                identity = _raw_identity(json.load(handle))
+            episode_id = path_to_episode_id.get(identity)
+            if episode_id is None or "/success/" not in f"/{identity}/":
+                raw["not_karlp_success"] += 1
+                continue
+            serials = camera_serials.get(episode_id, {})
+            calibration = cam2base.get(episode_id, {})
+            views = [
+                view for view, filename in VIEWS.items()
+                if (episode / filename).is_file()
+                and str(serials.get("ext1_cam_serial" if view.endswith("1_left") else "ext2_cam_serial", "")) in calibration
+            ]
+            if not views:
+                raw["no_karlp_calibrated_front_view"] += 1
+                continue
             table = pq.read_table(
                 episode / "episode.parquet",
                 columns=["t", "steps/observation/gripper_position"],
             )
-            with (episode / "metadata.json").open("r", encoding="utf-8") as handle:
-                identity = _raw_identity(json.load(handle))
             frames = table.column("t").to_numpy(zero_copy_only=False)
             values = table.column("steps/observation/gripper_position").to_numpy(zero_copy_only=False)
         except Exception as exc:
@@ -98,6 +115,7 @@ def main() -> None:
     result = {
         "definition": "close = gripper_position <= 0.5 to > 0.5",
         "deduplication": "output coverage is unioned by KarlP episode identity, view, and raw t frame",
+        "raw_scope": "KarlP success episodes with an ext1/ext2 serial present in cam2base_extrinsics.json",
         "output_clips": dict(output),
         "raw": dict(raw),
         "elapsed_seconds": time.time() - started,
