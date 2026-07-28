@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import time
 from typing import Any
 
 import imageio.v2 as imageio
@@ -29,8 +31,12 @@ class WindowedRobotDataset(Dataset):
         self.target_offset = int(self.data_cfg.get("target_offset", 0))
         self.future_horizon = int(self.data_cfg.get("future_horizon", 0))
         self.chunk_size = int(cfg.get("action", {}).get("chunk_size", 1))
-        # Furthest future step a window must reach: chunk step N is at +N*future_horizon.
-        self.effective_future_horizon = self.future_horizon * max(1, self.chunk_size)
+        mapping_cfg = cfg.get("action", {}).get("mapping", {}) or {}
+        self.chunk_start_offset = int(mapping_cfg.get("chunk_start_offset", self.future_horizon))
+        self.chunk_stride = max(1, int(mapping_cfg.get("chunk_stride", max(1, self.future_horizon))))
+        # Preserve legacy future-pose semantics by default (+stride ... +H*stride),
+        # while native controls can start at action[t] (offset=0).
+        self.effective_future_horizon = self.chunk_start_offset + self.chunk_stride * max(0, self.chunk_size - 1)
         self.image_size = int(self.data_cfg["image_size"])
         self.action_stride = int(self.data_cfg.get("action_stride", 1))
         self.terminate_positive_window = int(self.data_cfg.get("terminate_positive_window", 5))
@@ -41,6 +47,9 @@ class WindowedRobotDataset(Dataset):
         self.proprioception_append_progress = bool(self.proprioception_cfg.get("append_progress", False))
         self.proprioception_append_gripper = bool(
             self.proprioception_cfg.get("append_current_gripper", False))
+        self.proprioception_gripper_continuous = bool(
+            self.proprioception_cfg.get("current_gripper_continuous", False))
+        self.proprioception_normalization = self.proprioception_cfg.get("normalization", {}) or {}
         # Step 7: per-episode tracked EE-neighborhood points (preproc/cotracker_ee_points.py).
         self.point_tracking_cfg = self.data_cfg.get("point_tracking", {})
         self.point_tracking_enabled = bool(self.point_tracking_cfg.get("enabled", False))
@@ -95,6 +104,14 @@ class WindowedRobotDataset(Dataset):
             source_float_cfg.get("back_max_frac", self.source_float_frac))
         if self.source_float_front_frac < 0.0 or self.source_float_back_frac < 0.0:
             raise ValueError("source_float front/back fractions must be non-negative")
+        source_time_crop_cfg = self.data_cfg.get("source_time_crop", {}) or {}
+        self.source_time_crop_enabled = bool(source_time_crop_cfg.get("enabled", False))
+        self.source_time_crop_min_seconds = float(source_time_crop_cfg.get("min_seconds", 10.0))
+        self.source_time_crop_max_seconds = float(source_time_crop_cfg.get("max_seconds", 30.0))
+        if self.source_time_crop_min_seconds <= 0.0:
+            raise ValueError("source_time_crop.min_seconds must be positive")
+        if self.source_time_crop_max_seconds < self.source_time_crop_min_seconds:
+            raise ValueError("source_time_crop.max_seconds must be >= min_seconds")
         # C20: Δt time-conditioning — emit per-frame real seconds-since-previous-sampled-frame so the
         # model knows the demo's pacing (fixed 8 frames, but a 3s clip vs 30s clip → very different Δt).
         self.dt_time_enabled = bool(self.data_cfg.get("dt_time_embed", {}).get("enabled", False))
@@ -147,9 +164,19 @@ class WindowedRobotDataset(Dataset):
         self._episodes = self._load_episodes()
         max_windows = self.data_cfg.get("max_windows")
         max_windows = None if max_windows in (None, "") else int(max_windows)
-        self._samples = build_windows(self._episodes, self.source_len, self.target_history_len, self.target_offset, self.action_stride, max_windows, self.effective_future_horizon)
         self._episode_by_id = {e.episode_id: e for e in self._episodes}
+        raw_samples = build_windows(
+            self._episodes, self.source_len, self.target_history_len, self.target_offset,
+            self.action_stride, max_windows, self.effective_future_horizon)
+        self._samples = self._apply_native_action_sampling(raw_samples)
+        self._known_video_lengths = {
+            Path(path): int(episode.num_steps)
+            for episode in self._episodes
+            for path in (episode.source_video_path, episode.target_video_path)
+            if path is not None
+        }
         self._video_cache: dict[Path, Any] = {}
+        self._incomplete_frames_dirs: set[Path] = set()
         # C24: per-window source-frame count k (depends only on episode num_steps) — for bucket sampling.
         if self.dynamic_source_enabled:
             k_by_ep = {e.episode_id: self._dynamic_source_len(e.num_steps) for e in self._episodes}
@@ -161,6 +188,143 @@ class WindowedRobotDataset(Dataset):
         """Per-window source-frame count k (for KBucketBatchSampler). None if not dynamic."""
         return self._window_k
 
+    def _native_sampling_fingerprint(self) -> dict:
+        cfg = self.data_cfg.get("native_action_sampling", {}) or {}
+        return {
+            "episode_ids": [e.episode_id for e in self._episodes],
+            "target_history_len": self.target_history_len,
+            "target_offset": self.target_offset,
+            "effective_future_horizon": self.effective_future_horizon,
+            "action_stride": self.action_stride,
+            "chunk_size": self.chunk_size,
+            "sampling": cfg,
+        }
+
+    @staticmethod
+    def _max_true_run(mask: np.ndarray) -> int:
+        best = run = 0
+        for value in np.asarray(mask, dtype=bool):
+            run = run + 1 if bool(value) else 0
+            best = max(best, run)
+        return best
+
+    def _build_native_action_sample_index(self, samples: list[tuple[str, int]]) -> list[tuple[str, int]]:
+        cfg = self.data_cfg.get("native_action_sampling", {}) or {}
+        by_episode: dict[str, list[int]] = {}
+        for episode_id, start in samples:
+            by_episode.setdefault(episode_id, []).append(int(start))
+
+        close_pool: list[tuple[str, int]] = []
+        release_pool: list[tuple[str, int]] = []
+        normal_pool: list[tuple[str, int]] = []
+        velocity_threshold = float(cfg.get("velocity_idle_threshold", 1e-3))
+        max_idle_run = int(cfg.get("max_idle_run", 7))
+        event_before = int(cfg.get("event_before", 8))
+        event_after = int(cfg.get("event_after", 16))
+        gripper_threshold = float(self.data_cfg.get("gripper_threshold", 0.5))
+
+        for episode_id, starts in by_episode.items():
+            payload = self._read_native_action_payload(self._episode_by_id[episode_id])
+            action_dict = payload.get("action_dict", {})
+            velocity = np.asarray(action_dict.get("joint_velocity"), dtype=np.float32)
+            gripper = np.asarray(action_dict.get("gripper_position"), dtype=np.float32).reshape(-1)
+            if velocity.ndim != 2 or velocity.shape[1] != 7 or len(gripper) != len(velocity):
+                raise ValueError(f"native action sampling requires [T,7] joint_velocity for {episode_id}")
+            is_open = gripper > gripper_threshold
+            transitions = np.diff(is_open.astype(np.int8))
+            close_events = np.flatnonzero(transitions == -1) + 1
+            release_events = np.flatnonzero(transitions == 1) + 1
+            idle = np.max(np.abs(velocity), axis=1) <= velocity_threshold
+
+            for start in starts:
+                target = int(start) + self.target_history_len - 1 + self.target_offset
+                lo = target + self.chunk_start_offset
+                hi = min(len(velocity), lo + self.chunk_stride * max(0, self.chunk_size - 1) + 1)
+                chunk_idle = idle[lo:hi:self.chunk_stride]
+                close_cover = bool(np.any((close_events >= target - event_before) & (close_events <= target + event_after)))
+                release_cover = bool(np.any((release_events >= target - event_before) & (release_events <= target + event_after)))
+                item = (episode_id, int(start))
+                if close_cover:
+                    close_pool.append(item)
+                if release_cover:
+                    release_pool.append(item)
+                if not close_cover and not release_cover and self._max_true_run(chunk_idle) <= max_idle_run:
+                    normal_pool.append(item)
+
+        ratios = np.asarray([
+            float(cfg.get("normal_ratio", 0.60)),
+            float(cfg.get("close_ratio", 0.22)),
+            float(cfg.get("release_ratio", 0.18)),
+        ], dtype=np.float64)
+        if np.any(ratios < 0) or ratios.sum() <= 0:
+            raise ValueError("native_action_sampling ratios must be non-negative with positive sum")
+        ratios /= ratios.sum()
+        pools = [normal_pool, close_pool, release_pool]
+        names = ["normal", "close", "release"]
+        missing = [name for name, pool, ratio in zip(names, pools, ratios) if ratio > 0 and not pool]
+        if missing:
+            raise RuntimeError(f"native action sampling pools are empty: {missing}")
+
+        total = int(cfg.get("num_samples", len(samples)))
+        counts = np.floor(ratios * total).astype(int)
+        counts[0] += total - int(counts.sum())
+        rng = np.random.default_rng(int(cfg.get("seed", self.cfg.get("train", {}).get("seed", 42))))
+        selected: list[tuple[str, int]] = []
+        for pool, count in zip(pools, counts):
+            if count <= 0:
+                continue
+            choices = rng.integers(0, len(pool), size=int(count))
+            selected.extend(pool[int(i)] for i in choices)
+        rng.shuffle(selected)
+        print(
+            "[native_action_sampling] "
+            f"raw={len(samples)} pools(normal={len(normal_pool)},close={len(close_pool)},release={len(release_pool)}) "
+            f"selected={len(selected)} ratios={ratios.round(3).tolist()}"
+        )
+        return selected
+
+    def _apply_native_action_sampling(self, samples: list[tuple[str, int]]) -> list[tuple[str, int]]:
+        cfg = self.data_cfg.get("native_action_sampling", {}) or {}
+        if self.split != "train" or not bool(cfg.get("enabled", False)):
+            return samples
+        cache_value = str(cfg.get("cache_path", "") or "")
+        if not cache_value:
+            return self._build_native_action_sample_index(samples)
+        cache_path = Path(cache_value)
+        fingerprint = self._native_sampling_fingerprint()
+
+        def load_cache() -> list[tuple[str, int]] | None:
+            if not cache_path.exists():
+                return None
+            data = json.loads(cache_path.read_text(encoding="utf-8"))
+            if data.get("fingerprint") != fingerprint:
+                return None
+            return [(str(e), int(s)) for e, s in data["samples"]]
+
+        cached = load_cache()
+        if cached is not None:
+            print(f"[native_action_sampling] loaded {len(cached)} windows from {cache_path}")
+            return cached
+
+        # Under torchrun, rank 0 builds once and all other ranks wait for the
+        # atomically-renamed cache file instead of scanning every parquet.
+        rank = int(os.environ.get("RANK", "0"))
+        if rank != 0:
+            deadline = time.monotonic() + float(cfg.get("cache_wait_seconds", 3600))
+            while time.monotonic() < deadline:
+                cached = load_cache()
+                if cached is not None:
+                    return cached
+                time.sleep(2.0)
+            raise TimeoutError(f"Timed out waiting for native sampling cache {cache_path}")
+
+        selected = self._build_native_action_sample_index(samples)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = cache_path.with_suffix(cache_path.suffix + f".{os.getpid()}.tmp")
+        temporary.write_text(json.dumps({"fingerprint": fingerprint, "samples": selected}), encoding="utf-8")
+        temporary.replace(cache_path)
+        return selected
+
     def _dynamic_source_len(self, num_steps: int) -> int:
         k = round(int(num_steps) / max(1e-6, self.dynamic_source_stride))
         return int(min(max(k, self.dynamic_source_min), self.dynamic_source_max))
@@ -168,6 +332,7 @@ class WindowedRobotDataset(Dataset):
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_video_cache"] = {}
+        state["_incomplete_frames_dirs"] = set()
         state["_ee_path_cache"] = {}
         return state
 
@@ -176,6 +341,10 @@ class WindowedRobotDataset(Dataset):
 
     def _read_action_payload(self, episode: EpisodeRecord) -> Any:
         raise NotImplementedError
+
+    def _read_native_action_payload(self, episode: EpisodeRecord) -> Any:
+        """Read fields needed by native-action indexing; adapters may provide a cheaper path."""
+        return self._read_action_payload(episode)
 
     def _action_at(self, payload: Any, step: int) -> np.ndarray:
         raise NotImplementedError
@@ -306,6 +475,9 @@ class WindowedRobotDataset(Dataset):
 
     def _clip_length(self, path: Path) -> int:
         """Frame count for a clip: from the pre-decoded frames dir if present, else the mp4 reader."""
+        known = getattr(self, "_known_video_lengths", {}).get(Path(path))
+        if known is not None and known > 0:
+            return int(known)
         fd = self._frames_dir(path)
         if fd is not None:
             n = self._frame_count_cache.get(fd)
@@ -316,12 +488,9 @@ class WindowedRobotDataset(Dataset):
         return self._video_length(self._reader(path))
 
     def _read_video_indices(self, path: Path, indices: list[int]) -> torch.Tensor:
-        fd = self._frames_dir(path)
-        if fd is not None:
-            length = self._frame_count_cache.get(fd) or self._clip_length(path)
-            if length > 0:
-                indices = [min(max(0, int(idx)), length - 1) for idx in indices]
-            frames = [image_to_tensor(imageio.imread(str(fd / f"{int(idx):06d}.{self.frames_ext}")), self.image_size) for idx in indices]
+        cached_paths = self._cached_frame_paths(path, indices)
+        if cached_paths is not None:
+            frames = [image_to_tensor(imageio.imread(str(frame_path)), self.image_size) for frame_path in cached_paths]
             return torch.stack(frames, dim=0)
         reader = self._reader(path)
         length = self._video_length(reader)
@@ -329,6 +498,27 @@ class WindowedRobotDataset(Dataset):
             indices = [min(max(0, int(idx)), length - 1) for idx in indices]
         frames = [image_to_tensor(reader.get_data(int(idx)), self.image_size) for idx in indices]
         return torch.stack(frames, dim=0)
+
+    def _cached_frame_paths(self, path: Path, indices: list[int]) -> list[Path] | None:
+        """Return cached frame paths only when this request is completely available.
+
+        Some legacy extraction jobs left partially populated ``frames/`` folders.
+        A single missing image marks that directory as incomplete for this worker,
+        so all later requests safely use the source video instead of crashing.
+        """
+        frames_dir = self._frames_dir(path)
+        if frames_dir is None or frames_dir in self._incomplete_frames_dirs:
+            return None
+        length = self._clip_length(path)
+        normalized = [
+            min(max(0, int(index)), length - 1) if length > 0 else int(index)
+            for index in indices
+        ]
+        paths = [frames_dir / f"{index:06d}.{self.frames_ext}" for index in normalized]
+        if all(frame_path.is_file() for frame_path in paths):
+            return paths
+        self._incomplete_frames_dirs.add(frames_dir)
+        return None
 
     def _compute_source_indices(self, episode: EpisodeRecord, start_index: int) -> list[int]:
         """Compute the source video frame indices (with train jitter) for a given window."""
@@ -357,15 +547,17 @@ class WindowedRobotDataset(Dataset):
             # C24: dynamic frame count for constant Δt (k = clamp(round(n/stride), min, max)).
             k = self._dynamic_source_len(episode.num_steps) if self.dynamic_source_enabled else self.source_len
             lo, hi = 0, source_length - 1
+            target_step = start_index + self.target_history_len - 1 + self.target_offset
+            if self.source_time_crop_enabled:
+                lo, hi = self._source_time_crop_bounds(source_length, target_step)
             # C18: float the linspace window start/end by up to float_frac of the clip (train only),
             # so the sampled frames cover a different span each epoch → demo diversity.
-            if self.source_float_enabled and self.split == "train" and source_length > 2:
+            elif self.source_float_enabled and self.split == "train" and source_length > 2:
                 front_span = self.source_float_front_frac * (source_length - 1)
                 back_span = self.source_float_back_frac * (source_length - 1)
                 # Keep the randomly cropped demonstration anchored no later
                 # than the current target window. Otherwise, an early target
                 # state may be paired with a source video that begins later.
-                target_step = start_index + self.target_history_len - 1 + self.target_offset
                 front_span = min(front_span, max(0, int(target_step)))
                 lo = int(round(float(torch.rand(()).item()) * front_span))
                 hi = int(round((source_length - 1) - float(torch.rand(()).item()) * back_span))
@@ -373,6 +565,32 @@ class WindowedRobotDataset(Dataset):
                     lo, hi = 0, source_length - 1
             indices = [int(round(x)) for x in np.linspace(lo, hi, k)]
         return self._jitter_source_indices(indices, source_length)
+
+    def _source_time_crop_bounds(self, source_length: int, target_step: int) -> tuple[int, int]:
+        """Choose a bounded-duration source interval that always contains the current frame."""
+        last = max(0, int(source_length) - 1)
+        target = min(max(0, int(target_step)), last)
+        max_span = max(1, int(round(self.source_time_crop_max_seconds * self.fps)))
+        if last <= max_span:
+            return 0, last
+
+        min_span = max(1, int(round(self.source_time_crop_min_seconds * self.fps)))
+        min_span = min(min_span, max_span)
+        if self.split == "train" and max_span > min_span:
+            span = int(torch.randint(min_span, max_span + 1, ()).item())
+        else:
+            span = max_span
+
+        first_lo = max(0, target - span)
+        last_lo = min(target, last - span)
+        if self.split == "train" and last_lo > first_lo:
+            lo = int(torch.randint(first_lo, last_lo + 1, ()).item())
+        else:
+            lo = min(max(0, target - span // 2), last - span)
+        hi = lo + span
+        if not lo <= target <= hi:
+            raise RuntimeError(f"source crop [{lo}, {hi}] does not contain target frame {target}")
+        return lo, hi
 
     def _read_source_video(self, episode: EpisodeRecord, start_index: int) -> torch.Tensor:
         indices = self._compute_source_indices(episode, start_index)
@@ -491,6 +709,14 @@ class WindowedRobotDataset(Dataset):
         """Read native front frames, apply one shared translation, then standard C37 preprocessing."""
         path = episode.target_video_path
         assert path is not None
+        cached_paths = self._cached_frame_paths(path, indices)
+        if cached_paths is not None:
+            frames = []
+            for frame_path in cached_paths:
+                image = imageio.imread(str(frame_path))
+                frames.append(image_to_tensor(
+                    translate_image_reflect(image, dx_frac, dy_frac), self.image_size))
+            return torch.stack(frames, dim=0)
         reader = self._reader(path)
         length = self._video_length(reader)
         frames = []
@@ -543,16 +769,21 @@ class WindowedRobotDataset(Dataset):
             action = self._action_at(payload, target_step).astype(np.float32)
         thr = float(self.data_cfg.get("gripper_threshold", 0.0))
         if action.ndim == 2:
-            # Action chunk [N, dim]: per-step gripper and terminate at +(k+1)*future_horizon.
+            # Action chunk [N, dim]: keep both the continuous gripper command and
+            # its thresholded event label.
             n = action.shape[0]
+            gripper_value = action[:, -1].astype(np.float32)
             gripper = (action[:, -1] > thr).astype(np.int64)
             term_steps = future_idx if future_idx is not None else [
-                min(target_step + (k + 1) * max(1, self.future_horizon), episode.num_steps - 1) for k in range(n)]
+                min(target_step + self.chunk_start_offset + k * self.chunk_stride, episode.num_steps - 1)
+                for k in range(n)]
             terminate = np.asarray([self._terminate_at(payload, int(s), episode.num_steps) for s in term_steps], dtype=np.int64)
             gripper_t = torch.as_tensor(gripper, dtype=torch.long)
+            gripper_value_t = torch.as_tensor(gripper_value, dtype=torch.float32)
             terminate_t = torch.as_tensor(terminate, dtype=torch.long)
         else:
             gripper_t = torch.tensor(self._gripper_at(action), dtype=torch.long)
+            gripper_value_t = torch.tensor(float(action[-1]), dtype=torch.float32)
             terminate_t = torch.tensor(int(self._terminate_at(payload, target_step, episode.num_steps)), dtype=torch.long)
         sample = {
             "episode_id": episode.episode_id,
@@ -560,22 +791,23 @@ class WindowedRobotDataset(Dataset):
             "target_step": int(target_step),
             "action": torch.as_tensor(action, dtype=torch.float32),
             "gripper": gripper_t,
+            "gripper_value": gripper_value_t,
             "terminate": terminate_t,
             "metadata": {"source_video_path": str(episode.source_video_path), "target_video_path": str(episode.target_video_path)},
         }
+        front_dx = front_dy = 0.0
         if self.load_videos:
             _src_idx = None
             if future_idx is not None:
-                source_video = self._read_video_indices(episode.source_video_path, future_idx)
                 _src_idx = list(future_idx)
             elif self.aux_traj_enabled:
                 # compute indices once so both the video and traj_target use the same frames
                 _src_idx = self._compute_source_indices(episode, start_index)
-                source_video = self._read_video_indices(episode.source_video_path, _src_idx)
                 traj_target = np.stack([self._camera_abs_pose_at(payload, int(i)) for i in _src_idx]).astype(np.float32)
                 sample["traj_target"] = torch.as_tensor(traj_target, dtype=torch.float32)  # [source_len, 10]
             else:
                 _src_idx = self._compute_source_indices(episode, start_index)
+            if not self.front_translation_enabled:
                 source_video = self._read_video_indices(episode.source_video_path, _src_idx)
             # C20: per-frame Δt (real seconds since previous sampled frame; first frame = 0). Lets the
             # model tell a fast short demo from a slow long one (same 8 frames, different pacing).
@@ -584,7 +816,6 @@ class WindowedRobotDataset(Dataset):
                 dt = np.zeros_like(idx_arr)
                 dt[1:] = np.diff(idx_arr) / max(1.0, float(self.fps))
                 sample["source_dt"] = torch.as_tensor(dt, dtype=torch.float32)  # [source_len]
-            front_dx = front_dy = 0.0
             if self.split == "train" and self.front_translation_enabled:
                 max_x = float(self.front_translation_cfg.get("max_x_frac", 0.0))
                 max_y = float(self.front_translation_cfg.get("max_y_frac", 0.0))
@@ -636,9 +867,21 @@ class WindowedRobotDataset(Dataset):
                     raise KeyError("append_current_gripper requires observations.gripper_position")
                 grip_values = np.asarray(grip_seq, dtype=np.float32).reshape(-1)
                 grip_idx = min(max(0, int(target_step)), len(grip_values) - 1)
-                grip_state = float(
-                    grip_values[grip_idx] > float(self.data_cfg.get("gripper_threshold", 0.0)))
+                if self.proprioception_gripper_continuous:
+                    grip_state = float(grip_values[grip_idx])
+                else:
+                    grip_state = float(
+                        grip_values[grip_idx] > float(self.data_cfg.get("gripper_threshold", 0.0)))
                 prop = np.concatenate([prop, np.asarray([grip_state], dtype=np.float32)])
+            if bool(self.proprioception_normalization.get("enabled", False)):
+                q01 = np.asarray(self.proprioception_normalization.get("q01", []), dtype=np.float32)
+                q99 = np.asarray(self.proprioception_normalization.get("q99", []), dtype=np.float32)
+                if q01.shape != prop.shape or q99.shape != prop.shape:
+                    raise ValueError(
+                        f"proprioception q01/q99 must match shape {prop.shape}, got {q01.shape}/{q99.shape}")
+                prop = (2.0 * (prop - q01) / np.maximum(q99 - q01, 1e-6) - 1.0)
+                if bool(self.proprioception_normalization.get("clip", True)):
+                    prop = np.clip(prop, -1.0, 1.0)
             sample["proprioception"] = torch.as_tensor(prop, dtype=torch.float32)
         if self.depth_enabled:
             depth_idx = future_idx if future_idx is not None else [target_step]

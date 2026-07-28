@@ -26,7 +26,11 @@ from r2r_gen2act.data.types import EpisodeRecord
 
 # columns we need from the parquet (array fields are stored as JSON strings)
 _OBS_CART = "steps/observation/cartesian_position"
+_OBS_JOINT = "steps/observation/joint_position"
 _OBS_GRIP = "steps/observation/gripper_position"
+_ACT_JOINT_VEL = "steps/action_dict/joint_velocity"
+_ACT_JOINT_POS = "steps/action_dict/joint_position"
+_ACT_GRIP = "steps/action_dict/gripper_position"
 _IS_LAST = "steps/is_last"
 _IS_TERM = "steps/is_terminal"
 
@@ -157,8 +161,17 @@ class DroidExOutDataset(OpenXDroidDataset):
         cached = self._payload_cache.get(episode.episode_id)
         if cached is not None:
             return cached
-        with open(episode.extra["extrinsics_path"], "r", encoding="utf-8") as f:
-            ext = json.load(f)
+        mapping_type = str(self.cfg.get("action", {}).get("mapping", {}).get("type", ""))
+        needs_calibration = (
+            str(self.proprioception_cfg.get("source", "")) == "camera_projection"
+            or "camera" in mapping_type
+            or self.aux_traj_enabled
+            or self.depth_enabled
+        )
+        ext = {}
+        if needs_calibration:
+            with open(episode.extra["extrinsics_path"], "r", encoding="utf-8") as f:
+                ext = json.load(f)
         episode_id = ext.get("episode_id", "")
         cams = ext.get("cameras", {})
         selection = str(self.data_cfg.get("camera_selection", "legacy_exterior_1"))
@@ -177,12 +190,12 @@ class DroidExOutDataset(OpenXDroidDataset):
                 f"Unknown data.camera_selection={selection!r}; expected "
                 "'legacy_exterior_1' or 'from_meta'"
             )
-        if camera_key not in cams:
+        if needs_calibration and camera_key not in cams:
             raise ValueError(
                 f"extrinsics.json for {episode.episode_id} has no {camera_key!r} camera "
                 f"selected from meta.camera={camera_name!r} (keys={list(cams.keys())})"
             )
-        cam = cams[camera_key]
+        cam = cams.get(camera_key, {})
         allowed_sources = self.data_cfg.get("allowed_camera_calibration_sources", [])
         if isinstance(allowed_sources, str):
             allowed_sources = [allowed_sources]
@@ -193,21 +206,27 @@ class DroidExOutDataset(OpenXDroidDataset):
                 f"Camera calibration source {calibration_source!r} for clip {episode.episode_id} "
                 f"is not in allowed_camera_calibration_sources={sorted(allowed_sources)}"
             )
-        serial = str(cam["serial"])
-        extrinsic_6d = [float(v) for v in cam["cam2base_extrinsics_6d"]]
+        serial = str(cam.get("serial", ""))
+        extrinsic_6d = [float(v) for v in cam.get("cam2base_extrinsics_6d", [])]
 
         # Read the larger parquet only after camera/calibration validation, so rejected
         # predicted calibrations do not add avoidable shared-filesystem I/O.
         meta_dir = episode.metadata_path.parent
         table = pq.read_table(str(meta_dir / "data.parquet"))
         cart = np.asarray(_json_col(table, _OBS_CART), dtype=np.float64)          # [T,6]
+        joint = np.asarray(_json_col(table, _OBS_JOINT), dtype=np.float64)        # [T,7]
+        joint_velocity = np.asarray(_json_col(table, _ACT_JOINT_VEL), dtype=np.float64)
+        joint_position_action = np.asarray(_json_col(table, _ACT_JOINT_POS), dtype=np.float64)
         grip = np.asarray(table.column(_OBS_GRIP).to_pylist(), dtype=np.float64).reshape(-1, 1)  # [T,1]
+        action_grip = np.asarray(table.column(_ACT_GRIP).to_pylist(), dtype=np.float64).reshape(-1, 1)
         is_last = [int(x) for x in table.column(_IS_LAST).to_pylist()] if _IS_LAST in table.column_names else [0] * len(cart)
         is_term = [int(x) for x in table.column(_IS_TERM).to_pylist()] if _IS_TERM in table.column_names else [0] * len(cart)
 
-        intr_ep = self._intrinsics().get(episode_id, {})
+        intr_ep = self._intrinsics().get(episode_id, {}) if needs_calibration else {}
         intr = intr_ep.get(serial)
-        if not isinstance(intr, dict) or "cameraMatrix" not in intr:
+        if not needs_calibration:
+            calibration = {"extrinsics": {}, "intrinsics": {}}
+        elif not isinstance(intr, dict) or "cameraMatrix" not in intr:
             # signal "no calibration" -> filtered out upstream
             calibration = {"extrinsics": {serial: extrinsic_6d}, "intrinsics": {}}
         else:
@@ -226,7 +245,13 @@ class DroidExOutDataset(OpenXDroidDataset):
             "num_steps": int(len(cart)),
             "observations": {
                 "cartesian_position": cart,
+                "joint_position": joint,
                 "gripper_position": grip,
+            },
+            "action_dict": {
+                "joint_velocity": joint_velocity,
+                "joint_position": joint_position_action,
+                "gripper_position": action_grip,
             },
             "calibration": calibration,
             "image_shape": [H, W, 3],
@@ -243,6 +268,22 @@ class DroidExOutDataset(OpenXDroidDataset):
         if len(self._payload_cache) < 256:
             self._payload_cache[episode.episode_id] = payload
         return payload
+
+    def _read_native_action_payload(self, episode: EpisodeRecord) -> dict:
+        """Read only the two parquet columns needed to build the C39 event index."""
+        assert episode.metadata_path is not None
+        table = pq.read_table(
+            str(episode.metadata_path.parent / "data.parquet"),
+            columns=[_ACT_JOINT_VEL, _ACT_GRIP],
+        )
+        return {
+            "action_dict": {
+                "joint_velocity": np.asarray(_json_col(table, _ACT_JOINT_VEL), dtype=np.float32),
+                "gripper_position": np.asarray(
+                    table.column(_ACT_GRIP).to_pylist(), dtype=np.float32
+                ).reshape(-1, 1),
+            }
+        }
 
     def _read_front_geometry_at(
         self, episode: EpisodeRecord, indices: list[int]

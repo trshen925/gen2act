@@ -38,6 +38,23 @@ def _base_to_camera_rotation(payload: dict, mapping_cfg: dict | None = None) -> 
 
 
 def droid_action(payload: dict, step: int, mapping_type: str = "droid_actions_first6_plus_gripper", future_horizon: int = 0, chunk_size: int = 1, mapping_cfg: dict | None = None) -> np.ndarray:
+    if mapping_type == "droid_action_dict_joint_velocity":
+        action_dict = payload.get("action_dict", {})
+        velocity = np.asarray(action_dict["joint_velocity"], dtype=np.float32)
+        gripper = np.asarray(action_dict["gripper_position"], dtype=np.float32).reshape(len(velocity), -1)
+        if velocity.ndim != 2 or velocity.shape[1] != 7:
+            raise ValueError(f"DROID joint_velocity has shape {velocity.shape}, expected [T,7]")
+        # Native DROID alignment: observation[t] conditions action[t:t+H]. The
+        # configurable offset/stride also supports explicit timing ablations.
+        mapping_cfg = mapping_cfg or {}
+        first_offset = int(mapping_cfg.get("chunk_start_offset", 0))
+        stride = max(1, int(mapping_cfg.get("chunk_stride", 1)))
+        rows = []
+        for k in range(max(1, int(chunk_size))):
+            action_step = min(max(0, int(step) + first_offset + k * stride), len(velocity) - 1)
+            rows.append(np.concatenate((velocity[action_step], gripper[action_step, :1])))
+        chunk = np.stack(rows, axis=0).astype(np.float32)
+        return chunk[0] if int(chunk_size) <= 1 else chunk
     if mapping_type == "droid_actions_first6_plus_gripper":
         arr = np.asarray(payload["actions"][step], dtype=np.float32)
         if arr.shape[0] < 7:

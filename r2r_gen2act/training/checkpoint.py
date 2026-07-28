@@ -5,16 +5,33 @@ from pathlib import Path
 import torch
 
 
-def save_checkpoint(path: str | Path, model, optimizer, cfg: dict, epoch: int, metrics: dict) -> None:
+def save_checkpoint(
+    path: str | Path,
+    model,
+    optimizer,
+    cfg: dict,
+    epoch: int,
+    metrics: dict,
+    *,
+    ema_state_dict: dict[str, torch.Tensor] | None = None,
+    ema_decay: float | None = None,
+) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({
+    training_state = model.state_dict()
+    checkpoint = {
         "epoch": epoch,
-        "model_state_dict": model.state_dict(),
+        # Inference/export always sees the smoothed weights when EMA is enabled.
+        "model_state_dict": ema_state_dict if ema_state_dict is not None else training_state,
         "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
         "config": cfg,
         "metrics": metrics,
-    }, path)
+    }
+    if ema_state_dict is not None:
+        checkpoint["training_model_state_dict"] = training_state
+        checkpoint["ema_state_dict"] = ema_state_dict
+        checkpoint["ema_decay"] = float(ema_decay) if ema_decay is not None else None
+    torch.save(checkpoint, path)
 
 
 def save_slim_checkpoint(path: str | Path, checkpoint: dict) -> None:
@@ -31,7 +48,13 @@ def save_slim_checkpoint(path: str | Path, checkpoint: dict) -> None:
     torch.save(slim, path)
 
 
-def load_checkpoint(path: str | Path, model, device, strict: bool = True) -> dict:
+def load_checkpoint(
+    path: str | Path,
+    model,
+    device,
+    strict: bool = True,
+    exclude_prefixes: tuple[str, ...] = (),
+) -> dict:
     ckpt = torch.load(path, map_location=device)
     if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
         state = ckpt["model_state_dict"]
@@ -42,7 +65,9 @@ def load_checkpoint(path: str | Path, model, device, strict: bool = True) -> dic
     compat = getattr(model, "checkpoint_state_dict_compat", None)
     if callable(compat):
         state = compat(state)
-    if strict:
+    if exclude_prefixes:
+        state = {k: v for k, v in state.items() if not k.startswith(exclude_prefixes)}
+    if strict and not exclude_prefixes:
         model.load_state_dict(state, strict=True)
         return ckpt
     # Non-strict: load matching-shape params directly; for shape-mismatched params (e.g.

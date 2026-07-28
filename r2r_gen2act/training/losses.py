@@ -10,6 +10,8 @@ def compute_losses(outputs: dict[str, torch.Tensor], batch: dict, codec: ActionC
     weights = cfg["train"].get("losses", {})
     pose_dims = codec.pose_dims
     diffuse_gripper = bool(cfg.get("model", {}).get("flow_dit", {}).get("diffuse_gripper", False))
+    gripper_cfg = cfg.get("action", {}).get("gripper", {}) or {}
+    continuous_gripper = bool(gripper_cfg.get("continuous", False))
     # Leading dims may be [B] (single action) or [B, N] (action chunk); flatten them so the same
     # code path handles both. The last dim is always the action/pose dimension.
     action = batch["action"][..., :pose_dims].reshape(-1, pose_dims)
@@ -32,8 +34,14 @@ def compute_losses(outputs: dict[str, torch.Tensor], batch: dict, codec: ActionC
             action_pred = outputs["action_pred"].reshape(-1, flow_dims)
             target = codec.normalize(action)  # flow head predicts normalized [-1, 1] actions
             if diffuse_gripper:
-                grip = batch["gripper"].reshape(-1, 1).to(device=target.device, dtype=target.dtype)
-                target = torch.cat((target, grip.mul(2.0).sub(1.0)), dim=-1)
+                gripper_key = "gripper_value" if continuous_gripper else "gripper"
+                grip = batch[gripper_key].reshape(-1, 1).to(device=target.device, dtype=target.dtype)
+                grip = codec.normalize_scalar(
+                    grip,
+                    float(gripper_cfg.get("bounds_low", 0.0)),
+                    float(gripper_cfg.get("bounds_high", 1.0)),
+                )
+                target = torch.cat((target, grip), dim=-1)
             per_dim = (action_pred - target).pow(2).mean(dim=0)
             dim_losses = [per_dim[dim] for dim in range(pose_dims)]
             loss_action = per_dim.mean()
@@ -47,7 +55,11 @@ def compute_losses(outputs: dict[str, torch.Tensor], batch: dict, codec: ActionC
             for dim in range(pose_dims):
                 metrics[f"action_dim_{dim}_mae"] = abs_err[:, dim].mean()
             if diffuse_gripper:
-                gripper_prob = ((action_pred[:, pose_dims] + 1.0) * 0.5).clamp(0.0, 1.0)
+                gripper_prob = codec.unnormalize_scalar(
+                    action_pred[:, pose_dims],
+                    float(gripper_cfg.get("bounds_low", 0.0)),
+                    float(gripper_cfg.get("bounds_high", 1.0)),
+                ).clamp(0.0, 1.0)
                 gripper_target = batch["gripper"].reshape(-1).to(
                     device=gripper_prob.device, dtype=gripper_prob.dtype)
                 metrics["gripper_accuracy"] = ((gripper_prob >= 0.5) == (gripper_target >= 0.5)).float().mean()

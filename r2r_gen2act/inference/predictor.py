@@ -76,18 +76,41 @@ class PolicyPredictor:
                 pose = self.codec.unnormalize(pred[..., :pose_dims])
             else:
                 pose = pred[..., :pose_dims]
+            execution_cfg = self.cfg.get("action", {}).get("execution", {}) or {}
+            if "clip_low" in execution_cfg or "clip_high" in execution_cfg:
+                pose = pose.clamp(
+                    min=float(execution_cfg.get("clip_low", float("-inf"))),
+                    max=float(execution_cfg.get("clip_high", float("inf"))),
+                )
             pose = pose.cpu()
             bins = None
         else:
             bins = outputs["action_logits"].argmax(dim=-1)
             pose = self.codec.decode(bins).cpu()
         if diffuse_gripper:
-            gripper_open = ((pred[..., pose_dims] + 1.0) * 0.5).clamp(0.0, 1.0)
+            gripper_cfg = self.cfg.get("action", {}).get("gripper", {}) or {}
+            gripper_open = self.codec.unnormalize_scalar(
+                pred[..., pose_dims],
+                float(gripper_cfg.get("bounds_low", 0.0)),
+                float(gripper_cfg.get("bounds_high", 1.0)),
+            ).clamp(0.0, 1.0)
             gripper_prob = torch.stack((1.0 - gripper_open, gripper_open), dim=-1).cpu()
         else:
             gripper_prob = outputs["gripper_logits"].softmax(dim=-1).cpu()
+        gripper_threshold = float(
+            (self.cfg.get("action", {}).get("gripper", {}) or {}).get("execution_threshold", 0.5))
+        gripper_action = (gripper_prob[..., 1] >= gripper_threshold).long()
         terminate_prob = outputs["terminate_logits"].softmax(dim=-1).cpu()
-        result = {"pose_action": pose, "gripper_prob": gripper_prob, "terminate_prob": terminate_prob}
+        result = {
+            "pose_action": pose,
+            "gripper_prob": gripper_prob,
+            "gripper_action": gripper_action,
+            "terminate_prob": terminate_prob,
+        }
+        execute_steps = int((self.cfg.get("action", {}).get("execution", {}) or {}).get("execute_steps", 0))
+        if execute_steps > 0 and pose.dim() >= 3:
+            result["execution_pose_action"] = pose[:, :execute_steps]
+            result["execution_gripper_action"] = gripper_action[:, :execute_steps]
         if bins is not None:
             result["action_bins"] = bins.cpu()
         # 6D rotation rep: orthonormalize the predicted [3:9] into a valid rotation matrix.
@@ -112,9 +135,13 @@ def predict_dataset_window(cfg: dict, checkpoint_path: str | Path, split: str, e
         "target_step": int(sample["target_step"]),
         "pose_action": pred["pose_action"][0].tolist(),
         "gripper_prob": pred["gripper_prob"][0].tolist(),
+        "gripper_action": pred["gripper_action"][0].tolist(),
         "terminate_prob": pred["terminate_prob"][0].tolist(),
         "checkpoint": str(checkpoint_path),
     }
+    if "execution_pose_action" in pred:
+        result["execution_pose_action"] = pred["execution_pose_action"][0].tolist()
+        result["execution_gripper_action"] = pred["execution_gripper_action"][0].tolist()
     if "action_bins" in pred:
         result["action_bins"] = pred["action_bins"][0].tolist()
     if "rotation_matrix" in pred:

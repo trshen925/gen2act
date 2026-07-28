@@ -1,0 +1,99 @@
+# C39: native pi0.5-DROID control interface on top of C38 visual conditioning.
+# observation[t] -> 15 consecutive 15 Hz commands action[t:t+15]:
+# seven joint-velocity controls plus one continuous gripper-position control.
+_base_: droidexFULL_C38_singlecurrent_wristletterbox_fronttranslate_fulltrain.yaml
+
+experiment:
+  name: droidexFULL_C39_jointvelocity_pi05_fulltrain
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidexFULL_C39_jointvelocity_pi05_fulltrain
+
+data:
+  future_horizon: 1
+  gripper_threshold: 0.5
+  # Eight source frames are sampled uniformly from a target-aware temporal crop.
+  # Long demonstrations are capped while the current observation always remains
+  # inside the selected source interval.
+  source_float:
+    enabled: false
+  source_time_crop:
+    enabled: true
+    min_seconds: 10.0
+    max_seconds: 30.0
+  proprioception:
+    enabled: true
+    source: observations
+    key: joint_position
+    step: target
+    dims: 7
+    append_progress: false
+    append_current_gripper: true
+    current_gripper_continuous: true
+    normalization:
+      enabled: true
+      clip: true
+      # Released pi0.5-DROID state q01/q99: 7 joint positions + gripper.
+      q01: [-0.8279732212, -0.8398311848, -0.8425482082, -2.7730152783, -1.8426181348, 1.1716566390, -2.0472648380, 0.0]
+      q99: [ 0.8996522881,  1.3854674704,  0.6920277433, -0.4542043057,  1.7323142409, 3.4672964780,  2.1984972073, 0.991]
+  aux_traj:
+    enabled: false
+  native_action_sampling:
+    enabled: true
+    cache_path: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/artifacts/c39_jointvelocity_window_index.json
+    velocity_idle_threshold: 0.001
+    max_idle_run: 7
+    event_before: 8
+    event_after: 16
+    normal_ratio: 0.60
+    close_ratio: 0.22
+    release_ratio: 0.18
+    seed: 42
+
+action:
+  dim: 8
+  pose_dims: 7
+  mode: flow
+  regression_normalize: true
+  chunk_size: 15
+  bounds_source: config
+  # Released pi0.5-DROID joint-velocity q01/q99.
+  bounds_low:  [-0.4580, -0.8076, -0.4472, -0.9268, -0.6456, -0.6460, -0.7616]
+  bounds_high: [ 0.4476,  0.7652,  0.4480,  0.7944,  0.6484,  0.6628,  0.7344]
+  gripper:
+    continuous: true
+    bounds_low: 0.0
+    bounds_high: 0.9998
+    execution_threshold: 0.5
+  execution:
+    clip_low: -1.0
+    clip_high: 1.0
+    execute_steps: 8
+  mapping:
+    type: droid_action_dict_joint_velocity
+    chunk_start_offset: 0
+    chunk_stride: 1
+
+model:
+  pose_action_dims: 7
+  proprioception_dim: 8
+  aux_traj:
+    enabled: false
+  flow_dit:
+    diffuse_gripper: true
+    num_eval_samples: 1
+
+train:
+  # Transfer C38 vision/readout/DiT blocks, but reset modules whose semantics or
+  # dimensions changed from Cartesian+binary-gripper to joint velocity.
+  resume_checkpoint: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidexFULL_C38_singlecurrent_wristletterbox_fronttranslate_fulltrain/best_model.pt
+  resume_full_checkpoint: null
+  resume_exclude_prefixes:
+    - ee_mlp
+    - head.action_encoder
+    - head.action_out
+  epochs: 15
+  num_workers: 4
+  persistent_workers: true
+  prefetch_factor: 2
+  ema:
+    enabled: true
+    decay: 0.99

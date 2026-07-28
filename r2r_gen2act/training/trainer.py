@@ -4,6 +4,7 @@ import json
 import math
 import os
 import time
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import torch
@@ -34,6 +35,39 @@ class DistributedEvalSampler(Sampler[int]):
     def __len__(self) -> int:
         remaining = len(self.dataset) - self.rank
         return max(0, (remaining + self.world_size - 1) // self.world_size)
+
+
+class ModelEMA:
+    def __init__(self, model: torch.nn.Module, decay: float) -> None:
+        if not 0.0 < float(decay) < 1.0:
+            raise ValueError("EMA decay must be between 0 and 1")
+        self.decay = float(decay)
+        self.state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        current = model.state_dict()
+        for key, value in current.items():
+            target = self.state[key]
+            if torch.is_floating_point(target):
+                target.mul_(self.decay).add_(value.detach(), alpha=1.0 - self.decay)
+            else:
+                target.copy_(value.detach())
+
+    def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:
+        if set(state) != set(self.state):
+            raise ValueError("EMA checkpoint keys do not match model keys")
+        for key, value in state.items():
+            self.state[key].copy_(value)
+
+    @contextmanager
+    def apply_to(self, model: torch.nn.Module):
+        backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        model.load_state_dict(self.state, strict=True)
+        try:
+            yield
+        finally:
+            model.load_state_dict(backup, strict=True)
 
 
 def _init_distributed() -> tuple[int, int, int, bool]:
@@ -216,7 +250,10 @@ def _build_scheduler(optimizer, cfg: dict, steps_per_epoch: int):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def run_epoch(model, loader, codec, cfg, device, optimizer=None, train: bool = True, scheduler=None, world_size: int = 1) -> dict[str, float]:
+def run_epoch(
+    model, loader, codec, cfg, device, optimizer=None, train: bool = True,
+    scheduler=None, world_size: int = 1, ema: ModelEMA | None = None,
+) -> dict[str, float]:
     model.train(train)
     totals: dict[str, float] = {}
     steps = 0
@@ -234,10 +271,16 @@ def run_epoch(model, loader, codec, cfg, device, optimizer=None, train: bool = T
                     pose_dims = codec.pose_dims
                     action_target = codec.normalize(batch["action"][..., :pose_dims].to(device))
                     if bool(cfg["model"].get("flow_dit", {}).get("diffuse_gripper", False)):
-                        # Binary {0,1} is represented as {-1,1}, just like the
-                        # normalized continuous action dimensions.
-                        gripper = batch["gripper"].to(device=device, dtype=action_target.dtype).unsqueeze(-1)
-                        action_target = torch.cat((action_target, gripper.mul(2.0).sub(1.0)), dim=-1)
+                        gripper_cfg = cfg.get("action", {}).get("gripper", {}) or {}
+                        continuous = bool(gripper_cfg.get("continuous", False))
+                        gripper_key = "gripper_value" if continuous else "gripper"
+                        gripper = batch[gripper_key].to(device=device, dtype=action_target.dtype).unsqueeze(-1)
+                        gripper = codec.normalize_scalar(
+                            gripper,
+                            float(gripper_cfg.get("bounds_low", 0.0)),
+                            float(gripper_cfg.get("bounds_high", 1.0)),
+                        )
+                        action_target = torch.cat((action_target, gripper), dim=-1)
                 point_track = batch.get("point_track")
                 extra = {}
                 ptc = batch.get("point_track_causal")
@@ -271,6 +314,8 @@ def run_epoch(model, loader, codec, cfg, device, optimizer=None, train: bool = T
                 if grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
+                if ema is not None:
+                    ema.update(model.module if hasattr(model, "module") else model)
                 if scheduler is not None:
                     scheduler.step()
         for k, v in losses.items():
@@ -324,6 +369,10 @@ def train(cfg: dict, device: str | None = None) -> Path:
     batch_size = int(cfg["train"]["batch_size"])  # per-GPU
     num_workers = int(cfg["train"].get("num_workers", 0))
     pin = device_obj.type == "cuda"
+    loader_kwargs = {"num_workers": num_workers, "pin_memory": pin}
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = bool(cfg["train"].get("persistent_workers", False))
+        loader_kwargs["prefetch_factor"] = max(1, int(cfg["train"].get("prefetch_factor", 2)))
     # C24: dynamic source frames → variable k per window → bucket batches by k (uniform k per batch
     # so source_video/traj_target collate cleanly). Only single-GPU supported.
     dynamic_source = bool(cfg["data"].get("dynamic_source", {}).get("enabled", False)) and train_ds.window_k() is not None
@@ -333,8 +382,8 @@ def train(cfg: dict, device: str | None = None) -> Path:
         from r2r_gen2act.data.bucket_sampler import KBucketBatchSampler
         train_bsampler = KBucketBatchSampler(train_ds.window_k(), batch_size, shuffle=bool(cfg["train"].get("shuffle", True)))
         val_bsampler = KBucketBatchSampler(val_ds.window_k(), batch_size, shuffle=False)
-        train_loader = DataLoader(train_ds, batch_sampler=train_bsampler, num_workers=num_workers, pin_memory=pin)
-        val_loader = DataLoader(val_ds, batch_sampler=val_bsampler, num_workers=num_workers, pin_memory=pin)
+        train_loader = DataLoader(train_ds, batch_sampler=train_bsampler, **loader_kwargs)
+        val_loader = DataLoader(val_ds, batch_sampler=val_bsampler, **loader_kwargs)
     else:
         train_sampler = DistributedSampler(
             train_ds,
@@ -344,8 +393,11 @@ def train(cfg: dict, device: str | None = None) -> Path:
         # Do not use DistributedSampler for evaluation: it pads with duplicates
         # when len(val) is not divisible by world_size, changing metric weights.
         val_sampler = DistributedEvalSampler(val_ds, rank, world_size) if is_dist else None
-        train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=train_sampler, shuffle=(bool(cfg["train"].get("shuffle", True)) and not is_dist), num_workers=num_workers, pin_memory=pin)
-        val_loader = DataLoader(val_ds, batch_size=batch_size, sampler=val_sampler, shuffle=False, num_workers=num_workers, pin_memory=pin)
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, sampler=train_sampler,
+            shuffle=(bool(cfg["train"].get("shuffle", True)) and not is_dist), **loader_kwargs)
+        val_loader = DataLoader(
+            val_ds, batch_size=batch_size, sampler=val_sampler, shuffle=False, **loader_kwargs)
 
     # Let rank 0 populate pretrained-weight caches first. This avoids every local
     # process concurrently downloading/writing a multi-GB DINO checkpoint.
@@ -364,9 +416,16 @@ def train(cfg: dict, device: str | None = None) -> Path:
     resume_ckpt = str(cfg["train"].get("resume_checkpoint", "") or "")
     if resume_ckpt:
         from r2r_gen2act.training.checkpoint import load_checkpoint
-        load_checkpoint(resume_ckpt, raw_model, device_obj, strict=False)
+        exclude_prefixes = tuple(str(v) for v in cfg["train"].get("resume_exclude_prefixes", []))
+        load_checkpoint(
+            resume_ckpt, raw_model, device_obj, strict=False,
+            exclude_prefixes=exclude_prefixes,
+        )
         if is_main:
-            print(f"[resume] loaded weights from {resume_ckpt} (fresh optimizer/scheduler)")
+            print(
+                f"[resume] loaded weights from {resume_ckpt} (fresh optimizer/scheduler; "
+                f"excluded={list(exclude_prefixes)})"
+            )
     if is_dist:
         dist_cfg = cfg["train"].get("distributed", {}) or {}
         model = DDP(
@@ -378,6 +437,8 @@ def train(cfg: dict, device: str | None = None) -> Path:
     opt_cfg = cfg["train"].get("optimizer", {})
     optimizer = torch.optim.AdamW(_param_groups(raw_model, cfg), betas=tuple(opt_cfg.get("betas", [0.9, 0.95])))
     scheduler = _build_scheduler(optimizer, cfg, len(train_loader))
+    ema_cfg = cfg["train"].get("ema", {}) or {}
+    ema = ModelEMA(raw_model, float(ema_cfg.get("decay", 0.99))) if bool(ema_cfg.get("enabled", False)) else None
 
     out_dir = Path(cfg["experiment"]["output_dir"])
     if is_main:
@@ -400,8 +461,10 @@ def train(cfg: dict, device: str | None = None) -> Path:
     full_resume = str(cfg["train"].get("resume_full_checkpoint", "") or "")
     if full_resume:
         ckpt = torch.load(full_resume, map_location=device_obj, weights_only=False)
-        raw_model.load_state_dict(ckpt["model_state_dict"], strict=True)
+        raw_model.load_state_dict(ckpt.get("training_model_state_dict", ckpt["model_state_dict"]), strict=True)
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if ema is not None:
+            ema.load_state_dict(ckpt.get("ema_state_dict", ckpt["model_state_dict"]))
         start_epoch = int(ckpt["epoch"]) + 1
         # Restore best val loss: prefer checkpoint metrics, fall back to CSV min
         val_m = (ckpt.get("metrics") or {}).get("val") or {}
@@ -435,22 +498,20 @@ def train(cfg: dict, device: str | None = None) -> Path:
         if is_dist:
             train_sampler.set_epoch(epoch)
         t0 = time.time()
-        train_metrics = run_epoch(model, train_loader, codec, cfg, device_obj, optimizer, train=True, scheduler=scheduler, world_size=world_size)
+        train_metrics = run_epoch(
+            model, train_loader, codec, cfg, device_obj, optimizer, train=True,
+            scheduler=scheduler, world_size=world_size, ema=ema,
+        )
 
         do_eval = (epoch % eval_every == 0) or (epoch == epochs)
         val_metrics = None
         if do_eval:
             raw_model.eval()
-            with torch.no_grad():
+            ema_context = ema.apply_to(raw_model) if ema is not None else nullcontext()
+            with ema_context, torch.no_grad():
                 val_metrics = run_epoch(
-                    raw_model,
-                    val_loader,
-                    codec,
-                    cfg,
-                    device_obj,
-                    None,
-                    train=False,
-                    world_size=world_size,
+                    raw_model, val_loader, codec, cfg, device_obj, None,
+                    train=False, world_size=world_size,
                 )
 
         if is_main:
@@ -478,10 +539,20 @@ def train(cfg: dict, device: str | None = None) -> Path:
             if val_metrics is not None:
                 msg += f" infer_loss={val_metrics['loss']:.4f}"
             print(f"{msg} time={time.time()-t0:.1f}s loss_plot={out_dir / 'loss_curve.png'}")
-            save_checkpoint(latest_path, raw_model, optimizer, cfg, epoch, {"train": train_metrics, "val": val_metrics})
+            save_checkpoint(
+                latest_path, raw_model, optimizer, cfg, epoch,
+                {"train": train_metrics, "val": val_metrics},
+                ema_state_dict=ema.state if ema is not None else None,
+                ema_decay=ema.decay if ema is not None else None,
+            )
             if val_metrics is not None and val_metrics["loss"] < best:
                 best = val_metrics["loss"]
-                save_checkpoint(out_dir / "best.pt", raw_model, optimizer, cfg, epoch, {"train": train_metrics, "val": val_metrics})
+                save_checkpoint(
+                    out_dir / "best.pt", raw_model, optimizer, cfg, epoch,
+                    {"train": train_metrics, "val": val_metrics},
+                    ema_state_dict=ema.state if ema is not None else None,
+                    ema_decay=ema.decay if ema is not None else None,
+                )
         if is_dist:
             dist.barrier()
 

@@ -25,6 +25,7 @@ VIEWS = {
 KARLP_PATHS = Path("/mnt/pfs/data/shentingrui/KarlP-droid/episode_id_to_path.json")
 KARLP_SERIALS = Path("/mnt/pfs/data/shentingrui/KarlP-droid/camera_serials.json")
 KARLP_EXTRINSICS = Path("/mnt/pfs/data/shentingrui/KarlP-droid/cam2base_extrinsics.json")
+KARLP_EXTRINSICS_SUPERSET = Path("/mnt/pfs/data/shentingrui/KarlP-droid/cam2base_extrinsic_superset.json")
 RAW_PATH_PREFIX = "gs://xembodiment_data/r2d2/r2d2-data-full/"
 
 
@@ -35,6 +36,19 @@ def _raw_identity(metadata: dict) -> str:
     return path[len(RAW_PATH_PREFIX):-len("/trajectory.h5")]
 
 
+def _calibrated_serials(records: dict) -> dict[str, set[str]]:
+    """Extract the camera serial keys whose values are 6D cam-to-base poses."""
+    result: dict[str, set[str]] = {}
+    for episode_id, record in records.items():
+        serials = {
+            str(key) for key, value in record.items()
+            if isinstance(value, list) and len(value) == 6
+        }
+        if serials:
+            result[str(episode_id)] = serials
+    return result
+
+
 def main() -> None:
     started = time.time()
     with KARLP_PATHS.open("r", encoding="utf-8") as handle:
@@ -42,7 +56,13 @@ def main() -> None:
     with KARLP_SERIALS.open("r", encoding="utf-8") as handle:
         camera_serials = json.load(handle)
     with KARLP_EXTRINSICS.open("r", encoding="utf-8") as handle:
-        cam2base = json.load(handle)
+        cam2base = _calibrated_serials(json.load(handle))
+    with KARLP_EXTRINSICS_SUPERSET.open("r", encoding="utf-8") as handle:
+        superset = _calibrated_serials(json.load(handle))
+    # A camera may occur in either annotation file. The union avoids counting
+    # duplicated records twice while accepting every calibrated exterior view.
+    for episode_id, serials in superset.items():
+        cam2base.setdefault(episode_id, set()).update(serials)
     path_to_episode_id = {str(path): episode_id for episode_id, path in episode_paths.items()}
     # Unique DROID episode identity + camera -> source-frame intervals retained by output clips.
     retained: dict[tuple[str, str], list[tuple[int, int]]] = defaultdict(list)
@@ -115,7 +135,7 @@ def main() -> None:
     result = {
         "definition": "close = gripper_position <= 0.5 to > 0.5",
         "deduplication": "output coverage is unioned by KarlP episode identity, view, and raw t frame",
-        "raw_scope": "KarlP success episodes with an ext1/ext2 serial present in cam2base_extrinsics.json",
+        "raw_scope": "KarlP success episodes with an ext1/ext2 serial in the deduplicated union of cam2base_extrinsics.json and cam2base_extrinsic_superset.json",
         "output_clips": dict(output),
         "raw": dict(raw),
         "elapsed_seconds": time.time() - started,

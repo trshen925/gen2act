@@ -57,6 +57,15 @@ class ActionCodec:
         scale = (high - low).clamp(min=1e-6)
         return (norm.float() + 1.0) * 0.5 * scale + low
 
+    @staticmethod
+    def normalize_scalar(value: torch.Tensor, low: float, high: float) -> torch.Tensor:
+        clipped = value.clamp(min=float(low), max=float(high))
+        return (clipped - float(low)) / max(float(high) - float(low), 1e-6) * 2.0 - 1.0
+
+    @staticmethod
+    def unnormalize_scalar(value: torch.Tensor, low: float, high: float) -> torch.Tensor:
+        return (value.float() + 1.0) * 0.5 * (float(high) - float(low)) + float(low)
+
 
 def action_loss(logits: torch.Tensor, target_bins: torch.Tensor) -> torch.Tensor:
     return F.cross_entropy(logits.reshape(-1, logits.shape[-1]), target_bins.reshape(-1))
