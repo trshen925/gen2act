@@ -129,6 +129,7 @@ class WindowedRobotDataset(Dataset):
         # randomly seeking the mp4 (see scripts/extract_frames.py). Much faster; empty = use mp4.
         self.frames_subdir = str(self.data_cfg.get("frames_subdir", "") or "")
         self.frames_ext = str(self.data_cfg.get("frames_ext", "jpg"))
+        self.front_letterbox = bool(self.data_cfg.get("front_letterbox", False))
         wrist_cfg = self.data_cfg.get("wrist_current", {}) or {}
         self.wrist_current_enabled = bool(wrist_cfg.get("enabled", False))
         self.wrist_frames_subdir = str(wrist_cfg.get("frames_subdir", "wrist_frames"))
@@ -488,15 +489,19 @@ class WindowedRobotDataset(Dataset):
         return self._video_length(self._reader(path))
 
     def _read_video_indices(self, path: Path, indices: list[int]) -> torch.Tensor:
+        transform = image_to_letterbox_tensor if self.front_letterbox else image_to_tensor
         cached_paths = self._cached_frame_paths(path, indices)
         if cached_paths is not None:
-            frames = [image_to_tensor(imageio.imread(str(frame_path)), self.image_size) for frame_path in cached_paths]
+            frames = [transform(imageio.imread(str(frame_path)), self.image_size) for frame_path in cached_paths]
             return torch.stack(frames, dim=0)
         reader = self._reader(path)
-        length = self._video_length(reader)
+        # Raw DROID manifests already provide num_steps. Recounting an MP4 here
+        # launches a second ffmpeg scan for every sample, which is often slower
+        # than decoding the requested frames themselves.
+        length = self._clip_length(path)
         if length > 0:
             indices = [min(max(0, int(idx)), length - 1) for idx in indices]
-        frames = [image_to_tensor(reader.get_data(int(idx)), self.image_size) for idx in indices]
+        frames = [transform(reader.get_data(int(idx)), self.image_size) for idx in indices]
         return torch.stack(frames, dim=0)
 
     def _cached_frame_paths(self, path: Path, indices: list[int]) -> list[Path] | None:
@@ -709,20 +714,21 @@ class WindowedRobotDataset(Dataset):
         """Read native front frames, apply one shared translation, then standard C37 preprocessing."""
         path = episode.target_video_path
         assert path is not None
+        transform = image_to_letterbox_tensor if self.front_letterbox else image_to_tensor
         cached_paths = self._cached_frame_paths(path, indices)
         if cached_paths is not None:
             frames = []
             for frame_path in cached_paths:
                 image = imageio.imread(str(frame_path))
-                frames.append(image_to_tensor(
+                frames.append(transform(
                     translate_image_reflect(image, dx_frac, dy_frac), self.image_size))
             return torch.stack(frames, dim=0)
         reader = self._reader(path)
-        length = self._video_length(reader)
+        length = self._clip_length(path)
         frames = []
         for index in indices:
             index = min(max(0, int(index)), length - 1) if length > 0 else int(index)
-            frames.append(image_to_tensor(translate_image_reflect(reader.get_data(index), dx_frac, dy_frac), self.image_size))
+            frames.append(transform(translate_image_reflect(reader.get_data(index), dx_frac, dy_frac), self.image_size))
         return torch.stack(frames, dim=0)
 
     def _read_wrist_history(self, episode: EpisodeRecord, target_step: int) -> torch.Tensor:
@@ -746,7 +752,11 @@ class WindowedRobotDataset(Dataset):
 
     def _translate_model_projection(self, projection: np.ndarray, payload: dict, dx_frac: float, dy_frac: float) -> np.ndarray:
         """Move model-input EE coordinates by a native-frame translation."""
-        if not self.front_translation_enabled or str(self.proprioception_cfg.get("projection_image_space", "original")) != "model_input":
+        if (
+            not self.front_translation_enabled
+            or str(self.proprioception_cfg.get("source", "")) != "camera_projection"
+            or str(self.proprioception_cfg.get("projection_image_space", "original")) != "model_input"
+        ):
             return projection
         raw_h, raw_w = [int(x) for x in payload["image_shape"][:2]]
         scale = self.image_size / float(min(raw_h, raw_w))
@@ -823,9 +833,17 @@ class WindowedRobotDataset(Dataset):
                 front_dy = float((torch.rand(()) * 2.0 - 1.0) * max_y)
             if self.front_translation_enabled:
                 target_indices = [int(target_step) + offset for offset in self.current_history_offsets]
-                target_history = self._read_front_with_translation(episode, target_indices, front_dx, front_dy)
-                # Source demo frames are the same front camera and share this virtual principal-point shift.
-                source_video = self._read_front_with_translation(episode, _src_idx, front_dx, front_dy)
+                # Source and current use the same front MP4. Decode their union in
+                # ascending order so the ffmpeg reader never seeks backwards
+                # between two independent requests for the same sample.
+                combined_indices = sorted(set(target_indices + [int(index) for index in _src_idx]))
+                combined = self._read_front_with_translation(
+                    episode, combined_indices, front_dx, front_dy)
+                positions = {index: position for position, index in enumerate(combined_indices)}
+                target_history = torch.stack(
+                    [combined[positions[index]] for index in target_indices], dim=0)
+                source_video = torch.stack(
+                    [combined[positions[int(index)]] for index in _src_idx], dim=0)
             else:
                 target_history = self._read_target_history(episode, start_index)
             if self.split == "train":

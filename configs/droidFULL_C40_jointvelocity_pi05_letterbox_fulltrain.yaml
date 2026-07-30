@@ -1,0 +1,84 @@
+# C40: C39 control/model with raw successful DROID 1.0.1 episodes.
+# The offline manifest reproduces pi0.5-DROID non-idle filtering before C39's
+# close/release event-balanced sampling is applied.
+_base_: droidexFULL_C39_jointvelocity_pi05_fulltrain.yaml
+
+experiment:
+  name: droidFULL_C40_jointvelocity_pi05_letterbox_fulltrain
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidFULL_C40_jointvelocity_pi05_letterbox_fulltrain
+
+data:
+  dataset_type: raw_droid
+  root: /mnt/pfs/data/fenghaoran/droid/decompressed/1.0.1
+  filter_manifest: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/artifacts/raw_droid_1_0_1_pi05_manifest.json
+  # The manifest builder already validates every required path. Repeating 300k+
+  # stat calls independently on every DDP rank overloads PFS at startup.
+  validate_manifest_paths: false
+  max_episodes: null
+  max_windows: null
+  val_count: 500
+  # Keep C39's memory-bounded candidate index. The +/-5 jitter exposes the
+  # intervening native 15 Hz frames over epochs.
+  action_stride: 10
+  frames_subdir: ""
+  front_letterbox: true
+  camera_selection: deterministic_random
+  camera_seed: 42
+  parquet_payload_cache: 512
+  video_reader_cache: 16
+  source_time_crop:
+    enabled: true
+    min_seconds: 10.0
+    max_seconds: 20.0
+  wrist_current:
+    enabled: true
+    frames_subdir: wrist_frames
+    frames_ext: jpg
+    allow_video_fallback: true
+    letterbox: true
+  native_action_sampling:
+    enabled: true
+    cache_path: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/artifacts/c40_raw_droid_jointvelocity_window_index.json
+    # About 30M sample presentations over 15 epochs, comparable to the openpi
+    # full-DROID recipe's 100k steps x batch 256.
+    num_samples: 2000000
+    event_before: 8
+    event_after: 16
+    normal_ratio: 0.60
+    close_ratio: 0.22
+    release_ratio: 0.18
+    seed: 42
+
+train:
+  # Architecture and action semantics are unchanged from C39; load its EMA model.
+  resume_checkpoint: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidexFULL_C39_jointvelocity_pi05_fulltrain/latest_model.pt
+  resume_full_checkpoint: null
+  resume_exclude_prefixes: []
+  # Keep the geometry of step_000012000.pt so --resume-full-checkpoint can
+  # resume the interrupted epoch exactly on the original 3-GPU allocation.
+  batch_size: 12
+  epochs: 15
+  num_workers: 4
+  persistent_workers: true
+  prefetch_factor: 2
+  logging:
+    log_every: 100
+    wandb:
+      enabled: true
+      mode: online
+      project: gen2act
+      entity: trshen925-peking-university
+      group: c40_raw_droid
+      name: droidFULL_C40_jointvelocity_pi05_letterbox_fulltrain
+      # Prefer WANDB_API_KEY. This optional file is read without printing its content.
+      credential: /mnt/pfs/users/shentingrui/.credentials/wandb_api_trshen.txt
+  checkpoint:
+    # 2M samples / (3 GPUs * batch 12) = 55,556 steps/epoch. At the measured
+    # raw-MP4 throughput, 6k steps take roughly 4.4 hours.
+    every_steps: 6000
+    keep_last_step_checkpoints: 2
+  # Shuffle episode blocks, then read windows in temporal order inside each
+  # episode. This preserves stochastic episode order while avoiding pathological
+  # random seeks across 78k MP4 triplets.
+  episode_local_sampler:
+    enabled: true

@@ -1,0 +1,26 @@
+# Four-epoch continuation from C40 step 12k. Only EMA model weights are loaded;
+# optimizer, scheduler, EMA accumulator, epoch, and global step all start fresh.
+_base_: droidFULL_C40_jointvelocity_pi05_letterbox_fulltrain.yaml
+
+experiment:
+  name: droidFULL_C40_step12k_short4ep
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidFULL_C40_step12k_short4ep
+
+train:
+  resume_checkpoint: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidFULL_C40_jointvelocity_pi05_letterbox_fulltrain/step_000012000.pt
+  resume_full_checkpoint: null
+  epochs: 4
+  batch_size: 32
+  num_workers: 32
+  optimizer:
+    # Head LR. Backbone groups remain lower via multiplier=0.3 and LLRD=0.7.
+    lr: 1.0e-5
+  scheduler:
+    name: piecewise_linear
+    # [new-run epoch, ratio of optimizer.lr]. Interpolate linearly between points.
+    # Start close to the checkpoint's low LR, warm up over 0.2 epoch, then decay.
+    epoch_points: [[0.0, 0.288], [0.2, 1.0], [1.0, 1.0], [2.0, 0.8], [3.0, 0.4], [4.0, 0.1]]
+  logging:
+    wandb:
+      group: c40_raw_droid_short_schedule
+      name: droidFULL_C40_step12k_short4ep

@@ -1381,3 +1381,65 @@ XYZ MAE **1.855→1.672 cm（-9.9%）**，dx/dy corr 微升。ODE 积分更细 +
   3. 代价是close漏切换率提高至16.5%、cover recall降至0.704；C37对已经做出的切换时刻更准，但在其1秒窗口内更常完全不预测close。
   4. C37的1秒window与C35/C36的2.67秒window覆盖范围不同，不能把窗口数、recall或miss rate当作无条件公平的横向比较；时序量化改善是可靠信号，close漏检则是下一步需专门处理的问题。
 - **产物**: `outputs/droidexFULL_C37_dense15_current_gripper_singleflow_fulltrain/event_aware_eval32_single_seed0/event_aware_report.{md,json}`。
+
+## Exp C38 — 单帧当前观测 + wrist letterbox + 几何/颜色增强  ✅ 15 epoch完成
+
+- **目的**: 在C37的15Hz dense 15-step动作预测基础上，去掉front/wrist的三帧历史，只保留当前帧，测试单帧当前观测能否配合更强视觉增强工作；同时避免320x180腕部图像被center crop裁掉大面积左右视野。
+- **配置**: `configs/droidexFULL_C38_singlecurrent_wristletterbox_fronttranslate_fulltrain.yaml`；入口`bash scripts/run_train_c38_singlecurrent_wristletterbox_fronttranslate.sh`。
+- **相对C37的变化**:
+  1. `current_history_offsets: [-10,-5,0] -> [0]`，front和wrist均只输入当前一帧；因此C37的两组历史时间embedding不再使用。
+  2. wrist从center crop改为letterbox，完整保留320x180视野；本实验的front/source仍沿用center crop，front全面letterbox是C40才加入。
+  3. 训练时加入`+-10%` front平移，并对source与当前front使用同一平移；加入brightness/contrast/saturation=`0.30/0.40/0.50`的clip级颜色增强。
+  4. window加入`+-5`帧jitter。动作定义、8帧source、15Hz dense 15-step chunk、当前gripper输入和模型主体保持C37不变。
+- **数据/初始化**: `droid-ex-3000-out`，配置候选上限43415、train=42914 episodes、val=500；`action_stride=10`。从C37 ep10 `latest.pt`做weights-only warm start，fresh optimizer，5卡每卡batch=12，训练15 epoch。
+- **训练结果**:
+
+  | checkpoint/epoch | val loss | val action MAE | val action RMSE | gripper acc / Brier |
+  |---|---:|---:|---:|---:|
+  | ep1 | 0.022889 | 0.024934 | 0.046200 | 0.9583 / 0.04134 |
+  | best.pt = ep12 | **0.019119** | 0.023338 | 0.045695 | **0.9670 / 0.03299** |
+  | latest.pt = ep15 | 0.019506 | **0.022897** | **0.044963** | 0.9655 / 0.03442 |
+
+- **结论边界**: 训练和内置val正常收敛，ep15的action MAE/RMSE优于按总val loss选出的ep12；但没有找到与C37相同口径的800-window正式action/event-aware评估产物，因此不能仅凭这些数值断言单帧方案优于C37。`best_model.pt`是从C38 `best.pt`提取的model-only权重，后续作为C39初始化。
+- **产物**: `outputs/droidexFULL_C38_singlecurrent_wristletterbox_fronttranslate_fulltrain/{best.pt,best_model.pt,latest.pt,loss_history.csv}`。
+
+## Exp C39 — Pi0.5式原生joint velocity + 连续gripper action chunk  ✅ 15 epoch完成
+
+- **动机**: RoboLab执行中相机坐标系位姿动作经常能预测视觉目标但难以稳定落到机器人控制接口。C39改为直接预测DROID原生关节速度，验证joint velocity是否更适合闭环执行；视觉/任务条件仍使用8帧source video，而不是Pi0.5的语言prefix。
+- **配置**: `configs/droidexFULL_C39_jointvelocity_pi05_fulltrain.yaml`；入口`bash scripts/run_train_c39_jointvelocity_pi05.sh`。
+- **输入**: 8帧source video；当前front一帧；当前wrist一帧（letterbox）；当前7D joint position + 连续gripper position。state使用Pi0.5发布的DROID q01/q99归一化并clip。
+- **输出**: 从当前`t`开始的15个连续15Hz命令`action[t:t+15]`，每步为7D `action_dict/joint_velocity` + 1D连续`gripper_position`；flow head同时diffuse velocity和gripper。joint velocity按Pi0.5发布的q01/q99映射到`[-1,1]`，部署每次执行前8步再重规划。
+- **采样**: 在C38数据上建立原生动作索引；过滤长idle chunk，同时显式保留close/release邻域，训练采样比例normal/close/release=`60%/22%/18%`。source从包含当前帧的随机10--30秒区间均匀抽8帧，并保留source `delta t`。
+- **初始化/训练**: `droid-ex-3000-out`，train=42914 episodes/565946 windows，val=500 episodes/6673 windows。由C38 `best_model.pt`加载兼容视觉/DiT权重；因动作语义和维度变化，`ee_mlp`、`head.action_encoder`、`head.action_out`随机初始化。fresh optimizer，EMA=0.99，5卡global batch=60，15 epoch均完成。
+- **训练结果**:
+
+  | epoch | train loss | val loss | val action MAE | val action RMSE | gripper acc / Brier |
+  |---:|---:|---:|---:|---:|---:|
+  | 1 | 0.2861 | 0.08887 | 0.13612 | 0.18953 | 0.9406 / 0.04922 |
+  | 13 | 0.0780 | 0.06826 | 0.11302 | 0.16547 | 0.9490 / 0.04575 |
+  | 14 | 0.0775 | 0.06884 | 0.11352 | 0.16645 | 0.9496 / 0.04558 |
+  | 15 | **0.0767** | **0.06721** | **0.11198** | **0.16400** | **0.9500 / 0.04542** |
+
+- **真实执行初步观察（用户反馈）**: C39已经能够接近物体，说明直接预测joint velocity这条控制接口是可行的；这不是冻结val上的正式成功率评估，抓取闭合和抓后运动仍需event-aware/闭环量化。
+- **训练期间问题与修复**:
+  1. 首次集群运行因个别预解码frame缺失（如`00347/frames/000163.jpg`）崩溃；后续改为只有请求帧全部存在才读frame cache，否则回退MP4，正式15 epoch run完成。
+  2. C39训练时的front translation复用了camera-projection proprio修正逻辑，错误地平移了joint-position proprio的前两维。该bug后来在C40开发中修复为仅当`proprioception.source == camera_projection`时才调整。故C39是joint velocity可行性的有效正信号，但不是完全干净的最终基线。
+- **checkpoint说明**: `best.pt`和`latest.pt`均为完整checkpoint，最终落在ep15；`latest_model.pt`是按当时请求从ep14 checkpoint提取的model-only/EMA权重（文件名虽为latest_model，实际用于C40 warm start时对应ep14）。
+- **产物**: `outputs/droidexFULL_C39_jointvelocity_pi05_fulltrain/{best.pt,latest.pt,latest_model.pt,loss_history.csv}`；正式完成日志`logs/train_20260727_160818.log`。
+
+## Exp C40 — 全量原始DROID + Pi0.5过滤 + 全视野letterbox  🧰 数据/启动链路完成，尚未跑完epoch 1
+
+- **目的**: 将C39的joint-velocity策略扩展到原始全量DROID成功轨迹，使用Pi0.5一致的non-idle过滤清理长静止/碎片运动，同时继续过采样close/release事件；front/source也由center crop改为letterbox。
+- **配置与入口**: `configs/droidFULL_C40_jointvelocity_pi05_letterbox_fulltrain.yaml`；`bash scripts/run_train_c40_raw_droid_pi05.sh`。模型结构和动作语义与C39相同，从C39 ep14 `latest_model.pt`完整加载，fresh optimizer。
+- **原始数据**: `/mnt/pfs/data/fenghaoran/droid/decompressed/1.0.1`。manifest扫描95658 episodes，保留78724条成功且有效的episode；删除16794条非success、90条无non-idle range、41条过短和9条缺exterior-1视频。episode级划分为train=78224、val=500，无交叉。
+- **Pi0.5式过滤**: manifest复刻`compute_droid_nonidle_ranges.py`的速度差分idle定义、最短idle/non-idle段和range末尾trim。`action_stride=10`候选中train由2250776降至2084854，随后按normal/close/release=`60%/22%/18%`有放回抽成每epoch固定2000000个训练索引；val由14441降至13460，不做事件重采样。
+- **视频/条件处理**:
+  1. exterior-1/2按episode做确定性随机二选一；source和当前front来自同一成功episode与同一相机。
+  2. source、当前front、当前wrist全部letterbox到224x224；直接读取MP4，缺少预解码帧时自动fallback。
+  3. source从包含当前帧的随机10--20秒区间均匀抽8帧；短于20秒的episode使用完整视频，因此短于10秒的16190条轨迹不会被强行扩到10秒。
+  4. source保留真实`delta t`；合并source/current front索引并按升序一次解码，减少同一MP4内的反向seek。
+- **事件覆盖审计**: 78724条保留episode中有126167个close和130818个release；事件直接落入Pi keep range的比例为94.73%/98.50%，考虑stride-10事件邻域池后覆盖率为99.06%/99.62%，事件没有因过滤或索引步长大量丢失。
+- **索引/I/O设计**: 缓存索引含2000000条、1243780个不同`(episode,start)`；使用episode-local sampler按episode打乱、episode内按时间读取以提高MP4 cache命中。4卡启动时global batch=48。该顺序会让单卡local batch约59%只含一个episode，但DDP global batch和随机window/source/视觉增强会缓解相关性，当前判断为可接受的I/O折中。
+- **归一化审计**: 随机抽2000条保留episode（约54.1万Pi-kept帧），每个joint约1.86%--2.12%的速度落在q01/q99外；任一joint发生clip的帧占9.58%。训练前尚未修改该行为，后续应记录target saturation rate并视结果决定是否采用“不clip、允许归一化target超出`[-1,1]`”的Pi0.5式处理。
+- **当前状态（2026-07-28）**: 4卡任务完成pyarrow安装、manifest/index加载、C39权重加载、模型构建和NCCL初始化，日志确认`train_episodes=78224, train_windows=2000000, val_windows=13460`；但没有任何`epoch=...`记录，也没有loss history或checkpoint。因此C40只能记为**训练数据与启动链路验证完成，正式训练结果为空**，不能记为训练中或已完成。
+- **产物**: `artifacts/raw_droid_1_0_1_pi05_manifest.json`、`artifacts/c40_raw_droid_jointvelocity_window_index.json`；启动日志`outputs/droidFULL_C40_jointvelocity_pi05_letterbox_fulltrain/logs/train_20260728_134027.log`。

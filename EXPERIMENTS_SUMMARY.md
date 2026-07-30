@@ -435,3 +435,54 @@ C28 保持 C22 架构不变，将训练规模从 4,579 clips 扩到 **34,008 tra
 - 当前部署候选为 **C33 ep10 latest**；C33 的 `best.pt` 按总 val loss 选择，不代表位置最优。
 - 优先完成 C34 训练，并在 RoboLab 按夹爪闭合前后、`k=0` 执行结果及松开事件做闭环分段评估。
 - 继续保持固定公共验证集和 32/16 正式评估口径，避免 flow 采样噪声或 split 变化制造虚假提升。
+
+---
+
+# 新一周汇报（C35–C40：夹爪事件时序 → 15Hz 稠密控制 → 原生关节速度）
+
+## 一、本周主线
+
+本周从“增加观测信息”转向“让动作表示更贴近闭环控制”。首先将 gripper 并入 joint flow 并完成有/无深度消融（C35/C36），随后把稀疏的 2.67 s action chunk 改为连续 15Hz、1 s 的稠密序列（C37），再测试单帧视觉与更完整视野的数据增强方案（C38）。最后将输出从相机系位姿改为 DROID 原生 joint velocity（C39），并完成向全量原始 DROID 扩展的数据与启动链路（C40）。
+
+## 二、核心结果
+
+| 实验 | 主要改动 | 关键结果 | 结论 |
+|---|---|---|---|
+| C35 | gripper 作为第 10 个连续 flow 维度，2.67 s 稀疏 chunk | close/release 时序 MAE 428/228 ms | close recall 0.800，且闭合平均晚 3.31 帧 |
+| C36 | C35 去掉当前 front depth | close/release 时序 MAE 417/245 ms | 与 C35 几乎相同，当前深度没有解决夹爪时机问题 |
+| **C37** | **连续 15Hz、15-step、1 s chunk；当前夹爪状态；单 flow sample** | **XYZ MAE 0.945 cm；close/release 时序 MAE 144/81 ms** | 已检测事件的时序精度和系统性滞后显著改善，但 close 漏切换率升至 16.5% |
+| C38 | 单帧 current、wrist letterbox、平移/颜色增强 | ep15 内置 val action MAE/RMSE 0.02290/0.04496 | 正常收敛，但缺少与 C37 同口径的正式 action/event eval，不能判断是否更优 |
+| C39 | 输出改为 7D joint velocity + 连续 gripper | ep15 val action MAE 0.11198；真实执行可接近物体 | 原生控制接口可行，但指标与位姿模型不可横比，且本轮存在 proprio 平移 bug |
+| C40 | 全量原始 DROID、Pi0.5 non-idle 过滤、三路 letterbox | 78,224 train episodes、每 epoch 200 万 windows | 数据、索引和 DDP 启动链路已验证，尚无 epoch、loss 或 checkpoint |
+
+## 三、事件诊断：主要瓶颈从“位置误差”收敛到“闭合是否发生”
+
+C35/C36 的正式 event-aware 评估表明，close 明显比 release 困难：close recall 约 0.80，成功检测到的闭合仍平均晚约 3 帧；current front depth 的有无几乎不改变结果。夹爪转折前的 XYZ 约 1.33 cm，转折后才升至约 2.11 cm，说明更早暴露的是 gripper 时机，而不是位置先失控。
+
+C37 将动作改为逐帧 15Hz 输出后，成功检测事件的 close/release 时序 MAE 分别从 C35 的 428/228 ms 降至 144/81 ms，平均滞后从 3.31/2.94 帧降至 0.83/0.51 帧；事件邻域 XYZ 也降至 close 0.754→1.349 cm、release 0.399→0.663 cm。代价是 close 漏切换率从 6.7% 升到 16.5%，cover recall 降到 0.704。
+
+需要注意，C37 同时改变了 chunk 采样间隔、预测时域、当前夹爪输入和 flow sample 数；其 1 s horizon 也短于 C35/C36 的 2.67 s。因此 0.945 cm 整体 MAE、事件 recall 和漏检率不能与 C35/C36 做无条件直接比较。可靠结论是：**15Hz 稠密方案让已预测出的切换时刻更准，但 close 漏检成为新的首要问题。**
+
+## 四、视觉与控制接口探索
+
+### C38：尚不能证明单帧可以替代历史
+
+C38 同时去掉 front/wrist 历史、为 wrist 保留完整 letterbox 视野，并加入 front 平移、clip 级颜色增强和时间 jitter。训练内置验证集正常收敛，ep15 的 action MAE/RMSE 优于按总 val loss 选出的 ep12；但尚无冻结 800-window 和 event-aware 正式评估。由于改动是组合包，也不能仅凭内置 val 将结果归因于单帧、letterbox 或增强中的任一项。
+
+### C39：joint velocity 是可行方向，但需建立干净基线
+
+C39 直接预测连续 15Hz 的 7D joint velocity 和 gripper，避免相机系位姿动作到机器人控制接口的额外映射。15 epoch 持续收敛，真实执行已经能接近物体，是该控制表示的有效正信号；抓取闭合、抓后运动和成功率仍需正式 event-aware 与闭环量化。
+
+本轮 front translation 错误地修改了 joint-position proprio 的前两维，虽然不否定 joint velocity 的可行性，但使 C39 不能作为完全干净的最终基线。此外，动作语义和归一化均已改变，其 val MAE 不能与 C37/C38 的位姿 MAE 比较。
+
+### C40：全量数据基础设施完成，尚无模型结论
+
+C40 从 95,658 条原始 episode 中保留 78,724 条成功有效轨迹，Pi0.5 non-idle 过滤后构造每 epoch 200 万训练 windows；close/release 事件邻域覆盖率达到 99.06%/99.62%。三路图像统一 letterbox，数据索引、MP4 读取、权重加载和 4 卡 NCCL 启动均已验证。但截至 2026-07-28 尚未完成 epoch 1，因此不能记为“训练中已有结果”。归一化审计还发现 9.58% 的帧至少一个 joint velocity 超出 q01/q99 后被 clip，需要在正式训练中记录 target saturation。
+
+## 五、本周结论与下一步
+
+- 当前最明确的架构结论是：**稠密 15Hz action chunk 显著改善已检测夹爪事件的时序，但下一步必须专门提高 close recall、降低漏切换率。**
+- current front depth 对 C35/C36 的位置和事件指标均无实质影响，不应继续作为解决闭合时机的主要方向。
+- 位姿动作的当前正式候选是 **C37 ep10**；原生机器人控制接口的候选方向是 **C39 joint velocity**，但后者需修复 proprio 增强逻辑后补一轮干净对照。
+- 优先完成 C39 的正式 event-aware/真实闭环评估，并启动 C40 至有效 checkpoint；同时监控 joint velocity target saturation，再决定是否取消 q01/q99 clip。
+- C38 必须补齐与 C37 相同口径的冻结验证和事件评估，之后才能判断三帧历史是否可以被单帧 + letterbox/增强替代。

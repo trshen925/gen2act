@@ -27,6 +27,10 @@ def build_dataset(cfg: dict, split: str) -> Dataset:
         from r2r_gen2act.data.adapters.droid_ex_out import DroidExOutDataset
 
         return DroidExOutDataset(cfg, split=split)
+    if dtype == "raw_droid":
+        from r2r_gen2act.data.adapters.raw_droid import RawDroidDataset
+
+        return RawDroidDataset(cfg, split=split)
     if dtype == "robolab_sim":
         from r2r_gen2act.data.adapters.robolab_sim import RobolabSimDataset
 

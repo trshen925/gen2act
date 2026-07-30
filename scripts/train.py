@@ -19,8 +19,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--resume-full-checkpoint", type=Path, default=None)
     args = parser.parse_args()
     cfg = load_config(args.config)
+    if args.resume_full_checkpoint is not None:
+        cfg["train"]["resume_checkpoint"] = None
+        cfg["train"]["resume_full_checkpoint"] = str(args.resume_full_checkpoint)
     try:
         latest = train(cfg, device=args.device)
     finally:

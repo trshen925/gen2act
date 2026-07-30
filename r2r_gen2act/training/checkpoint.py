@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 
 import torch
 
@@ -15,6 +16,8 @@ def save_checkpoint(
     *,
     ema_state_dict: dict[str, torch.Tensor] | None = None,
     ema_decay: float | None = None,
+    scheduler_state_dict: dict | None = None,
+    progress: dict | None = None,
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -24,6 +27,8 @@ def save_checkpoint(
         # Inference/export always sees the smoothed weights when EMA is enabled.
         "model_state_dict": ema_state_dict if ema_state_dict is not None else training_state,
         "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
+        "scheduler_state_dict": scheduler_state_dict,
+        "progress": progress,
         "config": cfg,
         "metrics": metrics,
     }
@@ -31,7 +36,12 @@ def save_checkpoint(
         checkpoint["training_model_state_dict"] = training_state
         checkpoint["ema_state_dict"] = ema_state_dict
         checkpoint["ema_decay"] = float(ema_decay) if ema_decay is not None else None
-    torch.save(checkpoint, path)
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        torch.save(checkpoint, temporary)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def save_slim_checkpoint(path: str | Path, checkpoint: dict) -> None:

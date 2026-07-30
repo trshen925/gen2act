@@ -1,0 +1,4 @@
+name: gen2act
+dependencies:
+  - python=3.11
+  - pip

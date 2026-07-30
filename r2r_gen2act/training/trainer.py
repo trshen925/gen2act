@@ -19,6 +19,7 @@ from r2r_gen2act.modeling.factory import build_policy
 from r2r_gen2act.training.checkpoint import save_checkpoint
 from r2r_gen2act.training.losses import compute_losses
 from r2r_gen2act.training.seed import seed_everything
+from r2r_gen2act.training.wandb_logger import WandbLogger
 
 
 class DistributedEvalSampler(Sampler[int]):
@@ -237,7 +238,40 @@ def _build_scheduler(optimizer, cfg: dict, steps_per_epoch: int):
     warmup = max(0, min(warmup, total - 1))
     min_ratio = float(sch_cfg.get("min_lr_ratio", 0.0))
 
+    epoch_points: list[tuple[float, float]] = []
+    if name == "piecewise_linear":
+        raw_points = sch_cfg.get("epoch_points", [])
+        if not isinstance(raw_points, list) or len(raw_points) < 2:
+            raise ValueError(
+                "piecewise_linear scheduler requires at least two "
+                "scheduler.epoch_points entries"
+            )
+        for point in raw_points:
+            if not isinstance(point, (list, tuple)) or len(point) != 2:
+                raise ValueError(
+                    "each scheduler.epoch_points entry must be [epoch, lr_ratio]"
+                )
+            epoch, ratio = float(point[0]), float(point[1])
+            if epoch < 0.0 or ratio < 0.0:
+                raise ValueError("scheduler epoch points and LR ratios must be non-negative")
+            epoch_points.append((epoch, ratio))
+        if any(right[0] <= left[0] for left, right in zip(epoch_points, epoch_points[1:])):
+            raise ValueError("scheduler.epoch_points epochs must be strictly increasing")
+
+    def piecewise_ratio(epoch_progress: float) -> float:
+        if epoch_progress <= epoch_points[0][0]:
+            return epoch_points[0][1]
+        for (left_epoch, left_ratio), (right_epoch, right_ratio) in zip(
+            epoch_points, epoch_points[1:]
+        ):
+            if epoch_progress <= right_epoch:
+                alpha = (epoch_progress - left_epoch) / (right_epoch - left_epoch)
+                return left_ratio + alpha * (right_ratio - left_ratio)
+        return epoch_points[-1][1]
+
     def lr_lambda(step: int) -> float:
+        if name == "piecewise_linear":
+            return piecewise_ratio(step / max(1, steps_per_epoch))
         if step < warmup:
             return (step + 1) / max(1, warmup)
         progress = (step - warmup) / max(1, total - warmup)
@@ -245,7 +279,7 @@ def _build_scheduler(optimizer, cfg: dict, steps_per_epoch: int):
             return min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
         if name == "linear":
             return min_ratio + (1.0 - min_ratio) * max(0.0, 1.0 - progress)
-        return 1.0
+        raise ValueError(f"unsupported scheduler name: {name}")
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -253,6 +287,7 @@ def _build_scheduler(optimizer, cfg: dict, steps_per_epoch: int):
 def run_epoch(
     model, loader, codec, cfg, device, optimizer=None, train: bool = True,
     scheduler=None, world_size: int = 1, ema: ModelEMA | None = None,
+    step_offset: int = 0, step_callback=None, train_step_logger=None,
 ) -> dict[str, float]:
     model.train(train)
     totals: dict[str, float] = {}
@@ -321,6 +356,10 @@ def run_epoch(
         for k, v in losses.items():
             totals[k] = totals.get(k, 0.0) + float(v.detach().cpu())
         steps += 1
+        if train and train_step_logger is not None:
+            train_step_logger(step_offset + steps, losses)
+        if train and step_callback is not None:
+            step_callback(step_offset + steps)
     if world_size > 1 and dist.is_initialized():
         # Average metrics across ranks so logged loss reflects the global batch.
         keys = sorted(totals.keys())
@@ -385,17 +424,31 @@ def train(cfg: dict, device: str | None = None) -> Path:
         train_loader = DataLoader(train_ds, batch_sampler=train_bsampler, **loader_kwargs)
         val_loader = DataLoader(val_ds, batch_sampler=val_bsampler, **loader_kwargs)
     else:
-        train_sampler = DistributedSampler(
-            train_ds,
-            shuffle=bool(cfg["train"].get("shuffle", True)),
-            seed=int(cfg["train"].get("seed", 42)),
-        ) if is_dist else None
+        episode_local_cfg = cfg["train"].get("episode_local_sampler", {}) or {}
+        episode_local_enabled = bool(episode_local_cfg.get("enabled", False))
+        if episode_local_enabled:
+            from r2r_gen2act.data.episode_sampler import EpisodeLocalSampler
+
+            train_sampler = EpisodeLocalSampler(
+                train_ds,
+                rank=rank if is_dist else 0,
+                world_size=world_size if is_dist else 1,
+                shuffle=bool(cfg["train"].get("shuffle", True)),
+                seed=int(cfg["train"].get("seed", 42)),
+            )
+        else:
+            train_sampler = DistributedSampler(
+                train_ds,
+                shuffle=bool(cfg["train"].get("shuffle", True)),
+                seed=int(cfg["train"].get("seed", 42)),
+            ) if is_dist else None
         # Do not use DistributedSampler for evaluation: it pads with duplicates
         # when len(val) is not divisible by world_size, changing metric weights.
         val_sampler = DistributedEvalSampler(val_ds, rank, world_size) if is_dist else None
         train_loader = DataLoader(
             train_ds, batch_size=batch_size, sampler=train_sampler,
-            shuffle=(bool(cfg["train"].get("shuffle", True)) and not is_dist), **loader_kwargs)
+            shuffle=(bool(cfg["train"].get("shuffle", True)) and not is_dist and not episode_local_enabled),
+            **loader_kwargs)
         val_loader = DataLoader(
             val_ds, batch_size=batch_size, sampler=val_sampler, shuffle=False, **loader_kwargs)
 
@@ -436,7 +489,8 @@ def train(cfg: dict, device: str | None = None) -> Path:
         )
     opt_cfg = cfg["train"].get("optimizer", {})
     optimizer = torch.optim.AdamW(_param_groups(raw_model, cfg), betas=tuple(opt_cfg.get("betas", [0.9, 0.95])))
-    scheduler = _build_scheduler(optimizer, cfg, len(train_loader))
+    steps_per_epoch = len(train_loader)
+    scheduler = _build_scheduler(optimizer, cfg, steps_per_epoch)
     ema_cfg = cfg["train"].get("ema", {}) or {}
     ema = ModelEMA(raw_model, float(ema_cfg.get("decay", 0.99))) if bool(ema_cfg.get("enabled", False)) else None
 
@@ -456,6 +510,7 @@ def train(cfg: dict, device: str | None = None) -> Path:
     latest_path = out_dir / "latest.pt"
     history: list[dict] = []
     start_epoch = 1
+    resume_step_in_epoch = 0
 
     # Full resume: restore model + optimizer state and fast-forward scheduler.
     full_resume = str(cfg["train"].get("resume_full_checkpoint", "") or "")
@@ -465,7 +520,23 @@ def train(cfg: dict, device: str | None = None) -> Path:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         if ema is not None:
             ema.load_state_dict(ckpt.get("ema_state_dict", ckpt["model_state_dict"]))
-        start_epoch = int(ckpt["epoch"]) + 1
+        progress = ckpt.get("progress") or {}
+        saved_step_in_epoch = int(progress.get("step_in_epoch", steps_per_epoch))
+        saved_steps_per_epoch = int(progress.get("steps_per_epoch", steps_per_epoch))
+        saved_world_size = int(progress.get("world_size", world_size))
+        saved_batch_size = int(progress.get("batch_size", batch_size))
+        if saved_steps_per_epoch != steps_per_epoch or saved_world_size != world_size or saved_batch_size != batch_size:
+            raise ValueError(
+                "Mid-training resume requires the same loader geometry: "
+                f"checkpoint steps/world/batch={saved_steps_per_epoch}/{saved_world_size}/{saved_batch_size}, "
+                f"current={steps_per_epoch}/{world_size}/{batch_size}")
+        if saved_step_in_epoch < steps_per_epoch:
+            start_epoch = int(ckpt["epoch"])
+            resume_step_in_epoch = saved_step_in_epoch
+            if train_sampler is None or not hasattr(train_sampler, "set_start_index"):
+                raise ValueError("Mid-epoch resume requires a sampler with set_start_index()")
+        else:
+            start_epoch = int(ckpt["epoch"]) + 1
         # Restore best val loss: prefer checkpoint metrics, fall back to CSV min
         val_m = (ckpt.get("metrics") or {}).get("val") or {}
         if val_m and val_m.get("loss") is not None:
@@ -479,10 +550,14 @@ def train(cfg: dict, device: str | None = None) -> Path:
                         v = row2.get("val_loss", "")
                         if v not in ("", None):
                             best = min(best, float(v))
-        # Fast-forward scheduler to match completed steps (no gradient, just counters)
-        done_steps = (start_epoch - 1) * len(train_loader)
-        for _ in range(done_steps):
-            scheduler.step()
+        if scheduler is not None and ckpt.get("scheduler_state_dict") is not None:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        elif scheduler is not None:
+            # Backward compatibility with epoch-only checkpoints created before
+            # scheduler state and mid-epoch progress were persisted.
+            done_steps = (start_epoch - 1) * steps_per_epoch + resume_step_in_epoch
+            for _ in range(done_steps):
+                scheduler.step()
         # Reload loss history from CSV so plots stay continuous
         csv_path = out_dir / "loss_history.csv"
         if csv_path.exists():
@@ -492,16 +567,82 @@ def train(cfg: dict, device: str | None = None) -> Path:
                 for row in reader:
                     history.append({k: (float(v) if v != "" else None) for k, v in row.items()})
         if is_main:
-            print(f"[resume_full] loaded {full_resume} @ epoch {start_epoch - 1}, continuing from epoch {start_epoch}, best={best:.4f}")
+            print(
+                f"[resume_full] loaded {full_resume} @ epoch={ckpt['epoch']} "
+                f"step={saved_step_in_epoch}/{steps_per_epoch}; continuing from "
+                f"epoch={start_epoch} step={resume_step_in_epoch}, best={best:.4f}")
+
+    checkpoint_cfg = cfg["train"].get("checkpoint", {}) or {}
+    checkpoint_every_steps = max(0, int(checkpoint_cfg.get("every_steps", 0)))
+    keep_last_step_checkpoints = max(
+        1, int(checkpoint_cfg.get("keep_last_step_checkpoints", 2)))
+    wandb_logger = WandbLogger(
+        cfg, out_dir, is_main=is_main, world_size=world_size)
+    if is_dist:
+        wandb_enabled = torch.tensor(
+            int(wandb_logger.enabled), device=device_obj, dtype=torch.int32)
+        dist.broadcast(wandb_enabled, src=0)
+        wandb_logger.enabled = bool(wandb_enabled.item())
+        dist.barrier()
+
+    def save_step_checkpoint(epoch: int, step_in_epoch: int) -> None:
+        if checkpoint_every_steps <= 0 or step_in_epoch % checkpoint_every_steps != 0:
+            return
+        # The normal epoch checkpoint is more informative and is written shortly
+        # after the final step, so avoid writing a duplicate multi-GB file here.
+        if step_in_epoch >= steps_per_epoch:
+            return
+        global_step = (epoch - 1) * steps_per_epoch + step_in_epoch
+        if is_main:
+            step_path = out_dir / f"step_{global_step:09d}.pt"
+            save_checkpoint(
+                step_path, raw_model, optimizer, cfg, epoch, {},
+                ema_state_dict=ema.state if ema is not None else None,
+                ema_decay=ema.decay if ema is not None else None,
+                scheduler_state_dict=scheduler.state_dict() if scheduler is not None else None,
+                progress={
+                    "step_in_epoch": step_in_epoch,
+                    "global_step": global_step,
+                    "steps_per_epoch": steps_per_epoch,
+                    "world_size": world_size,
+                    "batch_size": batch_size,
+                },
+            )
+            step_paths = sorted(out_dir.glob("step_[0-9]*.pt"))
+            for stale_path in step_paths[:-keep_last_step_checkpoints]:
+                stale_path.unlink()
+            print(
+                f"[step_checkpoint] epoch={epoch} step={step_in_epoch}/{steps_per_epoch} "
+                f"global_step={global_step} path={step_path}")
+            wandb_logger.log_checkpoint(step_path, global_step=global_step)
+        if is_dist:
+            dist.barrier()
 
     for epoch in range(start_epoch, epochs + 1):
-        if is_dist:
+        if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
             train_sampler.set_epoch(epoch)
+        epoch_step_offset = resume_step_in_epoch if epoch == start_epoch else 0
+        if train_sampler is not None and hasattr(train_sampler, "set_start_index"):
+            train_sampler.set_start_index(epoch_step_offset * batch_size)
         t0 = time.time()
         train_metrics = run_epoch(
             model, train_loader, codec, cfg, device_obj, optimizer, train=True,
             scheduler=scheduler, world_size=world_size, ema=ema,
+            step_offset=epoch_step_offset,
+            step_callback=lambda step, current_epoch=epoch: save_step_checkpoint(current_epoch, step),
+            train_step_logger=lambda step, losses, current_epoch=epoch: wandb_logger.log_train_step(
+                losses,
+                global_step=(current_epoch - 1) * steps_per_epoch + step,
+                epoch=current_epoch,
+                step_in_epoch=step,
+                steps_per_epoch=steps_per_epoch,
+                optimizer=optimizer,
+                device=device_obj,
+            ),
         )
+        if train_sampler is not None and hasattr(train_sampler, "set_start_index"):
+            train_sampler.set_start_index(0)
+        resume_step_in_epoch = 0
 
         do_eval = (epoch % eval_every == 0) or (epoch == epochs)
         val_metrics = None
@@ -535,6 +676,7 @@ def train(cfg: dict, device: str | None = None) -> Path:
                         row[f"val_{key}"] = value
             history.append(row)
             _write_loss_history(out_dir, history)
+            wandb_logger.log_epoch(row, global_step=epoch * steps_per_epoch)
             msg = f"epoch={epoch} train_loss={train_metrics['loss']:.4f}"
             if val_metrics is not None:
                 msg += f" infer_loss={val_metrics['loss']:.4f}"
@@ -544,6 +686,14 @@ def train(cfg: dict, device: str | None = None) -> Path:
                 {"train": train_metrics, "val": val_metrics},
                 ema_state_dict=ema.state if ema is not None else None,
                 ema_decay=ema.decay if ema is not None else None,
+                scheduler_state_dict=scheduler.state_dict() if scheduler is not None else None,
+                progress={
+                    "step_in_epoch": steps_per_epoch,
+                    "global_step": epoch * steps_per_epoch,
+                    "steps_per_epoch": steps_per_epoch,
+                    "world_size": world_size,
+                    "batch_size": batch_size,
+                },
             )
             if val_metrics is not None and val_metrics["loss"] < best:
                 best = val_metrics["loss"]
@@ -552,10 +702,19 @@ def train(cfg: dict, device: str | None = None) -> Path:
                     {"train": train_metrics, "val": val_metrics},
                     ema_state_dict=ema.state if ema is not None else None,
                     ema_decay=ema.decay if ema is not None else None,
+                    scheduler_state_dict=scheduler.state_dict() if scheduler is not None else None,
+                    progress={
+                        "step_in_epoch": steps_per_epoch,
+                        "global_step": epoch * steps_per_epoch,
+                        "steps_per_epoch": steps_per_epoch,
+                        "world_size": world_size,
+                        "batch_size": batch_size,
+                    },
                 )
         if is_dist:
             dist.barrier()
 
     if is_dist:
         dist.destroy_process_group()
+    wandb_logger.finish()
     return latest_path

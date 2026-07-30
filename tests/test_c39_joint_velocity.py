@@ -54,6 +54,26 @@ class C39JointVelocityTest(unittest.TestCase):
         self.assertEqual(val_dataset._source_time_crop_bounds(1000, 20), (0, 450))
         self.assertEqual(val_dataset._source_time_crop_bounds(100, 50), (0, 99))
 
+    def test_front_read_uses_manifest_length_without_ffmpeg_frame_count(self) -> None:
+        class FakeReader:
+            @staticmethod
+            def get_data(index: int) -> np.ndarray:
+                return np.full((8, 12, 3), index % 256, dtype=np.uint8)
+
+        dataset = object.__new__(WindowedRobotDataset)
+        path = Path("episode/front.mp4")
+        dataset._known_video_lengths = {path: 1659}
+        dataset._cached_frame_paths = lambda *_: None
+        dataset._reader = lambda _: FakeReader()
+        dataset._video_length = lambda _: self.fail("known video length should not call count_frames")
+        dataset.front_letterbox = False
+        dataset.image_size = 8
+        episode = EpisodeRecord("ep", 1659, path, path, Path("episode/metadata.json"))
+
+        frames = dataset._read_front_with_translation(episode, [0, 100, 2000], 0.0, 0.0)
+
+        self.assertEqual(tuple(frames.shape), (3, 3, 8, 8))
+
     def test_native_joint_velocity_mapping_starts_at_current_action(self) -> None:
         velocity = np.arange(30 * 7, dtype=np.float32).reshape(30, 7)
         gripper = np.linspace(0.0, 1.0, 30, dtype=np.float32)
