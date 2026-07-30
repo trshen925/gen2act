@@ -1,4 +1,14 @@
 torch
 torchvision
+timm>=1.0.27
+huggingface-hub
 numpy
+scipy
 imageio
+imageio-ffmpeg
+pillow
+pyarrow
+h5py
+pyyaml
+matplotlib
+wandb==0.20.1

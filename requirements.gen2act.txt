@@ -6,6 +6,7 @@ imageio
 imageio-ffmpeg
 pillow
 pyarrow
+h5py
 pyyaml
 matplotlib
 pytest==8.1.1

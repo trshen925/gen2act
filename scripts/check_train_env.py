@@ -20,13 +20,15 @@ REQUIREMENTS = {
     "imageio_ffmpeg": "imageio-ffmpeg",
     "PIL": "pillow",
     "pyarrow": "pyarrow",
+    "h5py": "h5py",
     "yaml": "pyyaml",
     "matplotlib": "matplotlib",
+    "wandb": "wandb==0.20.1",
 }
 
 
 def _version(module_name: str) -> str:
-    package_name = REQUIREMENTS[module_name].split(">", 1)[0]
+    package_name = REQUIREMENTS[module_name].split("=", 1)[0].split(">", 1)[0]
     try:
         return importlib.metadata.version(package_name)
     except importlib.metadata.PackageNotFoundError:
@@ -49,6 +51,9 @@ def _missing_requirements() -> tuple[list[str], list[str]]:
         if "vit_large_patch16_dinov3" not in timm.list_models():
             missing.append("timm>=1.0.27")
             errors.append("timm: vit_large_patch16_dinov3 is not registered")
+    if "wandb==0.20.1" not in missing and _version("wandb") != "0.20.1":
+        missing.append("wandb==0.20.1")
+        errors.append(f"wandb: expected 0.20.1, found {_version('wandb')}")
     return sorted(set(missing)), errors
 
 

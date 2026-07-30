@@ -5,5 +5,15 @@ Summary: Robot-to-robot Gen2Act refactor for Franka/Open-X datasets
 Requires-Python: >=3.11
 Requires-Dist: torch
 Requires-Dist: torchvision
+Requires-Dist: timm>=1.0.27
+Requires-Dist: huggingface-hub
 Requires-Dist: numpy
+Requires-Dist: scipy
 Requires-Dist: imageio
+Requires-Dist: imageio-ffmpeg
+Requires-Dist: pillow
+Requires-Dist: pyarrow
+Requires-Dist: h5py
+Requires-Dist: pyyaml
+Requires-Dist: matplotlib
+Requires-Dist: wandb==0.20.1

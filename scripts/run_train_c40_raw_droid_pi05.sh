@@ -36,11 +36,10 @@ if ! "$PYTHON_BIN" -c 'import pytest' >/dev/null 2>&1; then
         pytest==8.1.1 iniconfig==2.0.0 pluggy==1.5.0
 fi
 
-# Isolate W&B from cluster-wide pip constraints. Every package is pinned and
-# installed without dependency resolution into shared PFS, so a new compute
-# node neither mutates nor depends on its image's conda environment.
-export PYTHONPATH="$WANDB_VENDOR_DIR${PYTHONPATH:+:$PYTHONPATH}"
+# New environments install W&B from requirements.gen2act.txt. Retain the
+# isolated shared install only as a fallback for older environments.
 if ! "$PYTHON_BIN" -c 'import wandb, google.protobuf; assert wandb.__version__ == "0.20.1"' >/dev/null 2>&1; then
+    export PYTHONPATH="$WANDB_VENDOR_DIR${PYTHONPATH:+:$PYTHONPATH}"
     echo "installing isolated W&B runtime into $WANDB_VENDOR_DIR"
     mkdir -p "$WANDB_VENDOR_DIR"
     "$PYTHON_BIN" -m pip install --target "$WANDB_VENDOR_DIR" --upgrade --no-deps \

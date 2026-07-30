@@ -15,8 +15,10 @@ dependencies = [
   "imageio-ffmpeg",
   "pillow",
   "pyarrow",
+  "h5py",
   "pyyaml",
   "matplotlib",
+  "wandb==0.20.1",
 ]
 
 [tool.setuptools.packages.find]

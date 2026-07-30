@@ -19,15 +19,8 @@ Default target is 7D `[dx, dy, dz, rx, ry, rz, gripper]`; the first 6 dims are t
 ## Environment setup
 
 The portable environment definition deliberately does not pin a CUDA toolkit or
-PyTorch CUDA build. Create an environment with the default PyTorch package for
-the target machine:
-
-```bash
-bash scripts/create_gen2act_env.sh gen2act
-```
-
-When the machine or cluster requires a specific PyTorch wheel index, supply it
-at install time instead of editing the environment definition:
+PyTorch CUDA build. Since pip cannot infer compatibility from the NVIDIA driver,
+select the appropriate PyTorch wheel index when creating the environment:
 
 ```bash
 TORCH_INDEX_URL=<site-or-platform-specific-index> \
