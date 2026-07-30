@@ -10,3 +10,4 @@ pyyaml
 matplotlib
 pytest==8.1.1
 tqdm
+wandb==0.20.1

@@ -40,10 +40,12 @@ run_in_env python -m pip install -e "$ROOT"
 
 run_in_env python -c '
 import torch
+import wandb
 print(f"torch={torch.__version__} bundled_cuda={torch.version.cuda}")
 print(f"cuda_available={torch.cuda.is_available()} gpu_count={torch.cuda.device_count()}")
 if torch.cuda.is_available():
     print(f"gpu0={torch.cuda.get_device_name(0)} bf16={torch.cuda.is_bf16_supported()}")
+print(f"wandb={wandb.__version__}")
 '
 
 echo "Created environment: $ENV_NAME"
