@@ -75,7 +75,11 @@ class RawDroidDataset(OpenXDroidDataset):
             print(f"[RawDroidDataset] mapped mode without filter manifest: {manifest_path}")
         self._manifest_path = manifest_path
         self._manifest_version = int(manifest.get("version", 0))
-        if self._manifest_version != 1:
+        # build_raw_droid_pi05_manifest.py emits version 2, which only adds
+        # episode-level provenance/language fields on top of version 1. Every
+        # field this adapter reads (episode_id, num_steps, keep_ranges,
+        # close_events, release_events) is unchanged, so both load.
+        if self._manifest_version not in (1, 2):
             raise ValueError(f"Unsupported raw DROID manifest version {self._manifest_version}")
         manifest_root = Path(str(manifest.get("root", ""))).resolve()
         if configured_root != manifest_root and not self._clip_mapping_by_id:
