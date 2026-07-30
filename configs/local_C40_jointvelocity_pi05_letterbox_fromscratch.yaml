@@ -1,0 +1,76 @@
+# C40 retargeted to this cluster (8x H100 80GB) and trained FROM SCRATCH.
+#
+# Everything about the task, model, action semantics, pi0.5 non-idle filtering and
+# close/release event balancing is inherited unchanged from
+# droidFULL_C40_jointvelocity_pi05_letterbox_fulltrain.yaml. Only what the
+# migration forces is overridden:
+#
+#   * data.root points at the decompressed DROID layout rebuilt locally by
+#     scripts/build_decompressed_droid_from_raw.py (the raw release on this
+#     machine is <lab>/<success>/<date>/<ts>/ with trajectory.h5, not
+#     episode_NNNNNN/episode.parquet). Videos are 320x180, as in the original.
+#   * No warm start. C39's latest_model.pt does not exist on this machine or on
+#     shared storage, so the DiT/mixer/heads start random and only DINOv2 keeps
+#     pretrained weights. The inherited 3e-5 / 15-epoch budget was a fine-tune
+#     schedule for a converged C39, so LR and epochs are raised accordingly.
+#   * 4 GPUs (0-3) instead of 3; GPUs 4-7 on this node are reserved for other
+#     work. Global batch is 48, which matches the 4-GPU global batch the original
+#     C40 launch used. The per-epoch sample count (2,000,000) is unchanged, so an
+#     epoch is 41,667 optimizer steps instead of 55,556.
+#
+# Results from this run are NOT a continuation of C39 and must not be compared
+# with C39's val numbers as if they were.
+_base_: droidFULL_C40_jointvelocity_pi05_letterbox_fulltrain.yaml
+
+experiment:
+  name: local_C40_jointvelocity_pi05_letterbox_fromscratch
+  output_dir: /mnt/project/simvla/world_policy_storage/gen2act/outputs/local_C40_jointvelocity_pi05_letterbox_fromscratch
+
+data:
+  root: /mnt/project/simvla/world_policy_storage/gen2act/droid-decompressed-1.0.1
+  filter_manifest: /mnt/project/simvla/world_policy_storage/gen2act/artifacts/raw_droid_1_0_1_pi05_manifest.json
+  native_action_sampling:
+    cache_path: /mnt/project/simvla/world_policy_storage/gen2act/artifacts/c40_raw_droid_jointvelocity_window_index.json
+
+train:
+  # From scratch: there is no checkpoint chain to inherit on this machine.
+  resume_checkpoint: null
+  resume_full_checkpoint: null
+  epochs: 20
+  batch_size: 12          # per GPU -> global 48 across 4x H100 80GB (GPUs 0-3)
+  # Raw-MP4 decode is the throughput bottleneck, so workers matter, but GPUs 4-7
+  # are reserved for other jobs that will need CPU for their own dataloaders.
+  num_workers: 12
+  persistent_workers: true
+  prefetch_factor: 2
+  optimizer:
+    name: adamw
+    # From-scratch LR rather than C40's 3e-5 fine-tune LR, which only made sense
+    # continuing a converged C39.
+    lr: 0.0001
+    backbone_lr_multiplier: 0.3
+    llrd: 0.7
+    weight_decay: 0.05
+    betas: [0.9, 0.95]
+  scheduler:
+    name: cosine
+    warmup_ratio: 0.05
+    min_lr_ratio: 0.05
+  checkpoint:
+    save_every_epochs: 1
+    # ~5k steps is well under an epoch here, so an interrupted run loses at most
+    # a fraction of an epoch. keep_last_step_checkpoints bounds the disk cost.
+    every_steps: 5000
+    keep_last_step_checkpoints: 2
+  logging:
+    log_every: 100
+    wandb:
+      enabled: true
+      mode: online
+      project: gen2act
+      group: c40_raw_droid_local
+      name: local_C40_jointvelocity_pi05_letterbox_fromscratch
+      # Same team as the original C40 runs; the key we were given belongs to it
+      # (verified: account trshen925, default entity trshen925-peking-university).
+      entity: trshen925-peking-university
+      credential: /mnt/home/sujiayi/.credentials/wandb_api.txt
