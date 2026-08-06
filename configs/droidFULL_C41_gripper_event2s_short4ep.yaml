@@ -1,0 +1,29 @@
+# C41: continue from C40 step 12k while concentrating training around gripper
+# close/release transitions. The sampler's event_before/event_after fields are
+# relative to the target frame, so [15, 45] covers target frames [-45, +15]:
+# three seconds before and one second after each event at 15 FPS.
+_base_: droidFULL_C40_step12k_short4ep.yaml
+
+experiment:
+  name: droidFULL_C41_gripper_event2s_short4ep
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidFULL_C41_gripper_event2s_short4ep
+
+data:
+  video_reader_cache: 4
+  native_action_sampling:
+    cache_path: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/artifacts/c41_raw_droid_gripper_target_pre3s_post1s_window_index.json
+    num_samples: 2000000
+    event_before: 15
+    event_after: 45
+    normal_ratio: 0.20
+    close_ratio: 0.40
+    release_ratio: 0.40
+    seed: 42
+
+train:
+  num_workers: 8
+  persistent_workers: false
+  logging:
+    wandb:
+      group: c41_gripper_event2s
+      name: droidFULL_C41_gripper_event2s_short4ep
