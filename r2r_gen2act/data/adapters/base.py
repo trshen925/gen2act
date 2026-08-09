@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections import OrderedDict
 from pathlib import Path
 import time
 from typing import Any
@@ -171,12 +172,24 @@ class WindowedRobotDataset(Dataset):
             self.action_stride, max_windows, self.effective_future_horizon)
         self._samples = self._apply_native_action_sampling(raw_samples)
         self._known_video_lengths = {
-            Path(path): int(episode.num_steps)
+            Path(path): int((episode.extra or {}).get("video_num_steps", episode.num_steps))
             for episode in self._episodes
             for path in (episode.source_video_path, episode.target_video_path)
             if path is not None
         }
+        # Raw-DROID wrist videos share the episode timeline. Clipped adapters
+        # use a non-zero source_frame_start and are deliberately excluded.
+        for episode in self._episodes:
+            wrist_path = str(episode.extra.get("wrist_video_path", "") or "")
+            if wrist_path and int(episode.extra.get("source_frame_start", 0)) == 0:
+                self._known_video_lengths[Path(wrist_path)] = int(episode.num_steps)
         self._video_cache: dict[Path, Any] = {}
+        # Optional per-worker raw-frame LRU. Keep raw frames so stochastic
+        # translation/augmentation still runs independently for each window.
+        self.decoded_frame_cache_mb = float(self.data_cfg.get("decoded_frame_cache_mb", 0.0))
+        self.decoded_frame_cache_block_frames = int(self.data_cfg.get("decoded_frame_cache_block_frames", 120))
+        self._decoded_frame_cache: OrderedDict[tuple[Path, int], tuple[np.ndarray, int]] = OrderedDict()
+        self._decoded_frame_cache_bytes = 0
         self._incomplete_frames_dirs: set[Path] = set()
         # C24: per-window source-frame count k (depends only on episode num_steps) — for bucket sampling.
         if self.dynamic_source_enabled:
@@ -494,6 +507,10 @@ class WindowedRobotDataset(Dataset):
         if cached_paths is not None:
             frames = [transform(imageio.imread(str(frame_path)), self.image_size) for frame_path in cached_paths]
             return torch.stack(frames, dim=0)
+        decoded = self._cached_raw_frames(path, indices)
+        if decoded is not None:
+            frames = [transform(frame, self.image_size) for frame in decoded]
+            return torch.stack(frames, dim=0)
         reader = self._reader(path)
         # Raw DROID manifests already provide num_steps. Recounting an MP4 here
         # launches a second ffmpeg scan for every sample, which is often slower
@@ -503,6 +520,43 @@ class WindowedRobotDataset(Dataset):
             indices = [min(max(0, int(idx)), length - 1) for idx in indices]
         frames = [transform(reader.get_data(int(idx)), self.image_size) for idx in indices]
         return torch.stack(frames, dim=0)
+
+    def _cached_raw_frames(self, path: Path, indices: list[int]) -> list[np.ndarray] | None:
+        """Decode/cache bounded contiguous blocks to avoid repeated random MP4 seeks."""
+        budget = int(max(0.0, getattr(self, "decoded_frame_cache_mb", 0.0)) * 1024 * 1024)
+        block_size = int(getattr(self, "decoded_frame_cache_block_frames", 120))
+        if budget <= 0 or block_size <= 0 or not indices:
+            return None
+        length = int(self._known_video_lengths.get(Path(path), 0))
+        if length <= 0:
+            return None
+        normalized = [min(max(0, int(index)), length - 1) for index in indices]
+        blocks: dict[int, np.ndarray] = {}
+        for index in sorted(set(normalized)):
+            block_id = index // block_size
+            key = (path, block_id)
+            cached = self._decoded_frame_cache.get(key)
+            if cached is None:
+                start = block_id * block_size
+                end = min(length, start + block_size)
+                reader = self._reader(path)
+                try:
+                    frames = np.stack([reader.get_data(i) for i in range(start, end)], axis=0)
+                except Exception:
+                    return None
+                size = int(frames.nbytes)
+                if size > budget:
+                    return None
+                while self._decoded_frame_cache and self._decoded_frame_cache_bytes + size > budget:
+                    _, (_, old_size) = self._decoded_frame_cache.popitem(last=False)
+                    self._decoded_frame_cache_bytes -= old_size
+                self._decoded_frame_cache[key] = (frames, size)
+                self._decoded_frame_cache_bytes += size
+            else:
+                frames = cached[0]
+                self._decoded_frame_cache.move_to_end(key)
+            blocks[block_id] = frames
+        return [blocks[index // block_size][index % block_size] for index in normalized]
 
     def _cached_frame_paths(self, path: Path, indices: list[int]) -> list[Path] | None:
         """Return cached frame paths only when this request is completely available.
@@ -530,7 +584,10 @@ class WindowedRobotDataset(Dataset):
         if episode.source_video_path is None:
             raise ValueError(f"Episode {episode.episode_id} has no source video")
         mode = str(self.data_cfg.get("source_sampling", "linspace"))
-        source_length = self._clip_length(episode.source_video_path) or episode.num_steps
+        if "front_frame_start" in (episode.extra or {}):
+            source_length = int(episode.num_steps)
+        else:
+            source_length = self._clip_length(episode.source_video_path) or episode.num_steps
         if mode == "window":
             start = min(start_index, max(0, source_length - self.source_len))
             indices = list(range(start, start + self.source_len))
@@ -599,7 +656,14 @@ class WindowedRobotDataset(Dataset):
 
     def _read_source_video(self, episode: EpisodeRecord, start_index: int) -> torch.Tensor:
         indices = self._compute_source_indices(episode, start_index)
-        return self._read_video_indices(episode.source_video_path, indices)
+        return self._read_video_indices(
+            episode.source_video_path, self._front_video_indices(episode, indices))
+
+    @staticmethod
+    def _front_video_indices(episode: EpisodeRecord, indices: list[int]) -> list[int]:
+        """Map logical clip-local indices onto a shared raw front video."""
+        offset = int((episode.extra or {}).get("front_frame_start", 0))
+        return [offset + int(index) for index in indices]
 
     def _jitter_source_indices(self, indices: list[int], source_length: int) -> list[int]:
         """Train-only per-frame wobble around the sampled source frames.
@@ -686,14 +750,18 @@ class WindowedRobotDataset(Dataset):
         if self.current_history_offsets != [0]:
             target_step = start_index + self.target_history_len - 1 + self.target_offset
             indices = [int(target_step) + offset for offset in self.current_history_offsets]
-            return self._read_video_indices(episode.target_video_path, indices)
-        return self._read_video_indices(episode.target_video_path, list(range(start_index, start_index + self.target_history_len)))
+            return self._read_video_indices(
+                episode.target_video_path, self._front_video_indices(episode, indices))
+        indices = list(range(start_index, start_index + self.target_history_len))
+        return self._read_video_indices(
+            episode.target_video_path, self._front_video_indices(episode, indices))
 
     def _read_wrist_current(self, episode: EpisodeRecord, target_step: int) -> torch.Tensor:
         """Read the wrist frame synchronized with the external current observation."""
         target_step = min(max(0, int(target_step)), max(0, int(episode.num_steps) - 1))
         cache_dir = Path(episode.metadata_path).parent / self.wrist_frames_subdir
-        cached = cache_dir / f"{target_step:06d}.{self.wrist_frames_ext}"
+        cache_index = int((episode.extra or {}).get("wrist_cache_frame_start", 0)) + target_step
+        cached = cache_dir / f"{cache_index:06d}.{self.wrist_frames_ext}"
         if cached.exists():
             image = imageio.imread(str(cached))
             return (image_to_letterbox_tensor(image, self.image_size)
@@ -705,6 +773,11 @@ class WindowedRobotDataset(Dataset):
         if not wrist_video.exists():
             raise FileNotFoundError(f"Missing raw wrist video for {episode.episode_id}: {wrist_video}")
         raw_idx = int(episode.extra.get("source_frame_start", 0)) + target_step
+        decoded = self._cached_raw_frames(wrist_video, [raw_idx])
+        if decoded is not None:
+            image = decoded[0]
+            return (image_to_letterbox_tensor(image, self.image_size)
+                    if self.wrist_letterbox else image_to_tensor(image, self.image_size))
         reader = self._reader(wrist_video)
         image = reader.get_data(raw_idx)
         return (image_to_letterbox_tensor(image, self.image_size)
@@ -714,12 +787,20 @@ class WindowedRobotDataset(Dataset):
         """Read native front frames, apply one shared translation, then standard C37 preprocessing."""
         path = episode.target_video_path
         assert path is not None
+        indices = self._front_video_indices(episode, indices)
         transform = image_to_letterbox_tensor if self.front_letterbox else image_to_tensor
         cached_paths = self._cached_frame_paths(path, indices)
         if cached_paths is not None:
             frames = []
             for frame_path in cached_paths:
                 image = imageio.imread(str(frame_path))
+                frames.append(transform(
+                    translate_image_reflect(image, dx_frac, dy_frac), self.image_size))
+            return torch.stack(frames, dim=0)
+        decoded = self._cached_raw_frames(path, indices)
+        if decoded is not None:
+            frames = []
+            for image in decoded:
                 frames.append(transform(
                     translate_image_reflect(image, dx_frac, dy_frac), self.image_size))
             return torch.stack(frames, dim=0)
@@ -818,7 +899,10 @@ class WindowedRobotDataset(Dataset):
             else:
                 _src_idx = self._compute_source_indices(episode, start_index)
             if not self.front_translation_enabled:
-                source_video = self._read_video_indices(episode.source_video_path, _src_idx)
+                source_video = self._read_video_indices(
+                    episode.source_video_path,
+                    self._front_video_indices(episode, _src_idx),
+                )
             # C20: per-frame Δt (real seconds since previous sampled frame; first frame = 0). Lets the
             # model tell a fast short demo from a slow long one (same 8 frames, different pacing).
             if self.dt_time_enabled and _src_idx is not None:

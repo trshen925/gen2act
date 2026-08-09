@@ -10,6 +10,7 @@ import torch
 from r2r_gen2act.data.action.codec import ActionCodec
 from r2r_gen2act.data.action.mappings import droid_action
 from r2r_gen2act.data.adapters.base import WindowedRobotDataset
+from r2r_gen2act.data.adapters.raw_droid import RawDroidDataset
 from r2r_gen2act.data.types import EpisodeRecord
 from r2r_gen2act.inference.predictor import PolicyPredictor
 from r2r_gen2act.modeling.flow_dit import FlowMatchingDiTHead
@@ -73,6 +74,48 @@ class C39JointVelocityTest(unittest.TestCase):
         frames = dataset._read_front_with_translation(episode, [0, 100, 2000], 0.0, 0.0)
 
         self.assertEqual(tuple(frames.shape), (3, 3, 8, 8))
+
+    def test_mapped_clip_offsets_front_indices_and_keeps_logical_length(self) -> None:
+        dataset = self._source_crop_dataset("val")
+        dataset._clip_length = lambda _: 1000
+        episode = EpisodeRecord(
+            "clip", 100, Path("raw.mp4"), Path("raw.mp4"), None,
+            extra={"front_frame_start": 200, "video_num_steps": 1000},
+        )
+        indices = dataset._compute_source_indices(episode, start_index=50)
+        self.assertEqual(indices[0], 0)
+        self.assertEqual(indices[-1], 99)
+        self.assertTrue(all(0 <= index < 100 for index in indices))
+        self.assertEqual(
+            dataset._front_video_indices(episode, [0, 50, 99]),
+            [200, 250, 299],
+        )
+
+    def test_c39_mapping_uses_exact_cached_training_samples(self) -> None:
+        dataset = object.__new__(RawDroidDataset)
+        dataset._clip_mapping_by_id = {"a": {}, "b": {}}
+        dataset._mapped_train_samples = [("b", 10), ("a", 20), ("b", 30)]
+        dataset.split = "train"
+        dataset.data_cfg = {"use_mapped_train_samples": True}
+
+        selected = dataset._apply_native_action_sampling([("a", 0), ("b", 0)])
+
+        self.assertEqual(selected, dataset._mapped_train_samples)
+
+    def test_c39_mapped_validation_can_exclude_training_raw_episodes(self) -> None:
+        mapping = {
+            "train": {"clip_id": "train", "raw_episode_id": "raw-a", "split": "train"},
+            "leaked": {"clip_id": "leaked", "raw_episode_id": "raw-a", "split": "val"},
+            "clean": {"clip_id": "clean", "raw_episode_id": "raw-b", "split": "val"},
+        }
+        train_raw = {
+            item["raw_episode_id"] for item in mapping.values() if item["split"] == "train"
+        }
+        kept_val = [
+            item["clip_id"] for item in mapping.values()
+            if item["split"] == "val" and item["raw_episode_id"] not in train_raw
+        ]
+        self.assertEqual(kept_val, ["clean"])
 
     def test_native_joint_velocity_mapping_starts_at_current_action(self) -> None:
         velocity = np.arange(30 * 7, dtype=np.float32).reshape(30, 7)

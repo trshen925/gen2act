@@ -12,6 +12,7 @@ train:
   epochs: 4
   batch_size: 32
   num_workers: 32
+  prefetch_factor: 2
   optimizer:
     # Head LR. Backbone groups remain lower via multiplier=0.3 and LLRD=0.7.
     lr: 1.0e-5
@@ -24,3 +25,15 @@ train:
     wandb:
       group: c40_raw_droid_short_schedule
       name: droidFULL_C40_step12k_short4ep
+
+data:
+  # The uniform sampler below reads every keep-range timestep directly; keep
+  # the candidate stride coarse so Dataset initialization does not materialize
+  # the full 20M-timestep temporary candidate list first.
+  action_stride: 10
+  window_jitter: {enabled: false, max_offset: 0}
+  native_action_sampling:
+    sampling_mode: keep_range_uniform
+    cache_path: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/artifacts/c40_raw_droid_pi05_keep_range_uniform_window_index.json
+  decoded_frame_cache_mb: 128
+  decoded_frame_cache_block_frames: 120

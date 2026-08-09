@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+RUN_LABEL="${RUN_LABEL:-C40}"
 CONFIG="${CONFIG:-configs/droidFULL_C40_jointvelocity_pi05_letterbox_fulltrain.yaml}"
 MANIFEST="${MANIFEST:-artifacts/raw_droid_1_0_1_pi05_manifest.json}"
 INDEX_JSON="${INDEX_JSON:-artifacts/c40_raw_droid_jointvelocity_window_index.json}"
@@ -20,12 +21,15 @@ if [[ ! -f "$MANIFEST" ]]; then
     echo "build it first with: bash scripts/build_raw_droid_pi05_manifest.sh" >&2
     exit 1
 fi
-for required in "$CONFIG" "$INDEX_JSON" "$WARM_START"; do
+for required in "$CONFIG" "$WARM_START"; do
     if [[ ! -f "$required" ]]; then
         echo "required file not found: $ROOT/$required" >&2
         exit 1
     fi
 done
+if [[ ! -f "$INDEX_JSON" ]]; then
+    echo "sampling index not found; rank 0 will build it: $ROOT/$INDEX_JSON"
+fi
 if [[ ! -x "$PYTHON_BIN" ]]; then
     echo "gen2act Python not found or not executable: $PYTHON_BIN" >&2
     exit 1
@@ -87,7 +91,7 @@ if expected not in teams and expected not in {viewer, api.default_entity}:
 print(f"W&B authentication OK: account={viewer} target={expected}/gen2act")
 PY
 then
-    echo "W&B authentication check failed; C40 training was not started." >&2
+    echo "W&B authentication check failed; $RUN_LABEL training was not started." >&2
     exit 1
 fi
 if ! command -v nvidia-smi >/dev/null 2>&1 || [[ "$(nvidia-smi -L 2>/dev/null | wc -l)" -lt 1 ]]; then
@@ -95,13 +99,13 @@ if ! command -v nvidia-smi >/dev/null 2>&1 || [[ "$(nvidia-smi -L 2>/dev/null | 
     exit 1
 fi
 if [[ "${C40_PREFLIGHT_ONLY:-0}" == "1" ]]; then
-    echo "C40 preflight OK; training was not started."
+    echo "$RUN_LABEL preflight OK; training was not started."
     exit 0
 fi
 
 mkdir -p "$LOG_DIR"
 export PYTHONUNBUFFERED=1
-echo "C40 raw DROID training"
+echo "$RUN_LABEL raw DROID training"
 echo "  config:   $ROOT/$CONFIG"
 echo "  manifest: $ROOT/$MANIFEST"
 echo "  index:    $ROOT/$INDEX_JSON"
@@ -127,6 +131,6 @@ TORCHRUN="${TORCHRUN:-$(dirname "$PYTHON_BIN")/torchrun}" \
 status=${PIPESTATUS[0]}
 set -e
 if [[ "$status" -ne 0 ]]; then
-    echo "C40 training exited with status $status; see $ROOT/$LOG_FILE" >&2
+    echo "$RUN_LABEL training exited with status $status; see $ROOT/$LOG_FILE" >&2
     exit "$status"
 fi

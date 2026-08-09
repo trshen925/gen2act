@@ -1,0 +1,46 @@
+# C42: C40 step-12k continuation on C39's exact filtered clip/window set, read
+# directly from full raw DROID. This is a dataset ablation against C40 and does
+# not inherit any C41 gripper-event settings.
+_base_: droidFULL_C40_step12k_short4ep.yaml
+
+experiment:
+  name: droidFULL_C42_c39_subset_step12k_short4ep
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidFULL_C42_c39_subset_step12k_short4ep
+
+data:
+  # Mapping mode does not require the C40 filter manifest; the new cluster only
+  # needs the full raw DROID root and this mapping JSON.
+  filter_manifest: ""
+  clip_mapping: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/metadata/c42_c39_to_raw_droid_mapping.json
+  use_mapped_train_samples: true
+  # Use C40's letterbox preprocessing for the raw full-resolution front video.
+  front_letterbox: true
+  video_reader_cache: 8
+  # C39 split by clip ID, which leaked overlapping clips from the same raw
+  # episode into validation. Keep its training set exact but exclude those val
+  # clips so C42 metrics are episode-disjoint.
+  exclude_mapped_val_raw_overlap: true
+  # The mapping preserves C39's original event-balanced 565,946-window index;
+  # do not add a second window jitter or C40 uniform resampling layer.
+  window_jitter: {enabled: false, max_offset: 0}
+  # Fixed source-video frame count for this experiment. Change this one value;
+  # the YAML anchor applies the same value to model.source_len below.
+  source_len: &c42_source_frames 8
+  source_time_crop:
+    enabled: true
+    min_seconds: 10.0
+    max_seconds: 30.0
+  native_action_sampling:
+    # C42 reads the exact C39 cached index from clip_mapping.train_samples;
+    # neither C40's manifest keep-ranges nor a new event sampler is applied.
+    enabled: false
+    cache_path: ""
+
+model:
+  source_len: *c42_source_frames
+
+train:
+  logging:
+    wandb:
+      group: c42_c39_subset_short_schedule
+      name: droidFULL_C42_c39_subset_step12k_short4ep
