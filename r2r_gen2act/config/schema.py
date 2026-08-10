@@ -44,3 +44,46 @@ def validate_config(cfg: dict) -> None:
             raise ValueError(
                 "data.proprioception.dims (+ optional progress/current-gripper dims) "
                 "must match model.proprioception_dim")
+
+    backbone = model.get("backbone", {}) or {}
+    backbone_name = str(backbone.get("name", "dinov2_vitb14")).lower()
+    wan_names = {"wan_vae", "wan2.1_vae", "wan2_1_vae", "wan_video_vae"}
+    if backbone_name in wan_names:
+        if str(model.get("type", "video_policy")) != "fused_query_flow":
+            raise ValueError("Wan-VAE requires model.type=fused_query_flow")
+        if int(model["image_size"]) % 8:
+            raise ValueError("Wan-VAE requires model.image_size divisible by 8")
+        if not bool(backbone.get("pretrained", True)):
+            raise ValueError("Wan-VAE must use pretrained weights")
+        if not bool(backbone.get("freeze", True)):
+            raise ValueError("Wan-VAE is a frozen encoder; set model.backbone.freeze=true")
+        if int(backbone.get("latent_dim", 16)) != 16:
+            raise ValueError("Wan 2.1 VAE checkpoints require model.backbone.latent_dim=16")
+        backend = str(backbone.get("backend", "official")).lower()
+        fallback_backends = backbone.get("fallback_backends", [])
+        if isinstance(fallback_backends, str):
+            fallback_backends = [fallback_backends]
+        known_backends = {"official", "diffusers", "diffsynth"}
+        if backend not in known_backends or any(str(name).lower() not in known_backends for name in fallback_backends):
+            raise ValueError("Wan-VAE backend/fallback_backends must use official, diffusers, or diffsynth")
+        if backend in {str(name).lower() for name in fallback_backends}:
+            raise ValueError("model.backbone.fallback_backends must not repeat model.backbone.backend")
+        if "diffusers" in (backend, *(str(name).lower() for name in fallback_backends)) and not str(
+            backbone.get("diffusers_model_id", "") or ""
+        ):
+            raise ValueError(
+                "Diffusers Wan-VAE backend/fallback requires model.backbone.diffusers_model_id"
+            )
+        if str(backbone.get("dtype", "bfloat16")).lower() not in {
+            "float32", "fp32", "bfloat16", "bf16", "float16", "fp16"
+        }:
+            raise ValueError("Unsupported model.backbone.dtype for Wan-VAE")
+        if bool(model.get("current_full_patch", False)):
+            raise ValueError("model.current_full_patch is DINO-only and incompatible with Wan-VAE")
+        if bool((model.get("front_depth", {}) or {}).get("enabled", False)):
+            raise ValueError("DINO patch geometry is incompatible with Wan-VAE")
+        readout = model.get("query_readout", {}) or {}
+        heads = int(readout.get("heads", 8))
+        hidden_dim = int(model.get("hidden_dim", 768))
+        if heads <= 0 or hidden_dim % heads:
+            raise ValueError("model.query_readout.heads must divide model.hidden_dim for Wan-VAE")

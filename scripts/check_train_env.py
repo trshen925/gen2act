@@ -14,6 +14,9 @@ REQUIREMENTS = {
     "torchvision": "torchvision",
     "timm": "timm>=1.0.27",
     "huggingface_hub": "huggingface-hub",
+    "einops": "einops",
+    "safetensors": "safetensors",
+    "tqdm": "tqdm",
     "numpy": "numpy",
     "scipy": "scipy",
     "imageio": "imageio",
@@ -65,6 +68,59 @@ def _install(requirements: list[str]) -> None:
     subprocess.check_call(
         [sys.executable, "-m", "pip", "install", "--upgrade", *requirements]
     )
+
+
+def _wan_backend_error(backend: str, backbone_cfg: dict) -> str | None:
+    """Return a diagnostic if a configured Wan backend cannot be imported.
+
+    This intentionally checks one backend at a time: a missing optional
+    fallback must not prevent training when the configured primary backend is
+    usable.
+    """
+    if backend in {"official", "diffsynth"}:
+        from r2r_gen2act.modeling.wan_vae import resolve_wan_checkpoint
+
+        checkpoint_env = str(backbone_cfg.get("checkpoint_env", "WAN_VAE_CHECKPOINT"))
+        checkpoint = resolve_wan_checkpoint(
+            str(backbone_cfg.get("local_checkpoint", "") or ""), checkpoint_env
+        )
+        if checkpoint is None or not checkpoint.is_file():
+            return (
+                "Wan-VAE weights are unavailable; set model.backbone.local_checkpoint "
+                f"or {checkpoint_env}"
+            )
+    if backend == "official":
+        from r2r_gen2act.modeling.wan_vae import _import_official_wan
+
+        try:
+            _import_official_wan(
+                str(backbone_cfg.get("official_root", "") or ""),
+                str(backbone_cfg.get("official_root_env", "WAN21_ROOT")),
+            )
+        except Exception as exc:
+            return (
+                "official Wan2.1 code is unavailable; set WAN21_ROOT to the official "
+                f"Wan2.1 repository root or install its `wan` package ({type(exc).__name__}: {exc})"
+            )
+        return None
+    if backend == "diffusers":
+        try:
+            importlib.import_module("diffusers")
+        except Exception as exc:
+            return f"Diffusers is unavailable ({type(exc).__name__}: {exc})"
+        return None
+    if backend == "diffsynth":
+        from r2r_gen2act.modeling.wan_vae import _import_diffsynth_wan
+
+        try:
+            _import_diffsynth_wan(
+                str(backbone_cfg.get("diffsynth_root", "") or ""),
+                str(backbone_cfg.get("diffsynth_root_env", "DIFFSYNTH_ROOT")),
+            )
+        except Exception as exc:
+            return f"DiffSynth-Studio is unavailable ({type(exc).__name__}: {exc})"
+        return None
+    return f"unsupported backend {backend!r}"
 
 
 def main() -> None:
@@ -146,6 +202,33 @@ def main() -> None:
                         "DINOv3-L weights are absent from the HF cache while HF_HUB_OFFLINE=1"
                     )
                 weight_cache = "not cached; rank 0 will download before training"
+    if backbone.lower() in {"wan_vae", "wan2.1_vae", "wan2_1_vae", "wan_video_vae"}:
+        from r2r_gen2act.modeling.wan_vae import resolve_wan_checkpoint
+
+        checkpoint = resolve_wan_checkpoint(
+            str(backbone_cfg.get("local_checkpoint", "") or ""),
+            str(backbone_cfg.get("checkpoint_env", "WAN_VAE_CHECKPOINT")),
+        )
+        backend = str(backbone_cfg.get("backend", "official")).lower()
+        fallbacks = backbone_cfg.get("fallback_backends", [])
+        if isinstance(fallbacks, str):
+            fallbacks = [fallbacks]
+        primary_error = _wan_backend_error(backend, backbone_cfg)
+        if primary_error:
+            raise SystemExit(f"Wan-VAE primary backend={backend!r}: {primary_error}")
+        for fallback in (str(name).lower() for name in fallbacks):
+            fallback_error = _wan_backend_error(fallback, backbone_cfg)
+            if fallback_error:
+                print(
+                    f"[preflight] warning: Wan-VAE fallback backend={fallback!r} is unavailable: "
+                    f"{fallback_error}",
+                    file=sys.stderr,
+                )
+        weight_cache = (
+            str(checkpoint)
+            if checkpoint is not None
+            else f"diffusers:{backbone_cfg.get('diffusers_model_id')} (local cache only)"
+        )
     per_gpu_batch = int(cfg["train"]["batch_size"])
     gpu_desc = []
     for index in range(visible_gpus):
@@ -164,7 +247,8 @@ def main() -> None:
         print(f"[preflight] dataset is frozen to sorted first {int(cfg['data']['max_episodes'])} candidate episodes")
     print("[preflight] devices=" + ", ".join(gpu_desc))
     if weight_cache:
-        print("[preflight] dinov3_weights=" + weight_cache)
+        weight_label = "dinov3_weights" if backbone.startswith("dinov3") else f"{backbone}_weights"
+        print(f"[preflight] {weight_label}=" + weight_cache)
 
 
 if __name__ == "__main__":

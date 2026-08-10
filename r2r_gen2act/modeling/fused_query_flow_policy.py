@@ -1,8 +1,8 @@
-"""C2 — C1's fused dual-track conditioning + flow-matching DiT head (instead of regression).
+"""Fused visual/state conditioning with a flow-matching DiT action head.
 
-Same conditioning as FusedQueryRegPolicy (Exp C1): query-in-backbone DINOv2 readout of the demo video
-+ current frame, a per-timestep PointTrajSeqEncoder for the GLOBAL demo trajectory and a second one for
-the CAUSAL recent-motion track, plus EE(u,v,depth)+progress tokens — each tagged with a type embedding.
+Visual inputs use either query-in-backbone DINO readout or cross-attention over Wan-VAE video latents.
+They are combined with the optional global/causal point trajectories and current robot state, with each
+conditioning source tagged by a learned type embedding.
 The ONLY change vs C1 is the head: the regression decoder (which collapses to the conditional mean ->
 pred_std<<tgt_std -> systematic under-prediction / trajectory drift) is replaced by the flow-matching
 DiT head, which models the action DISTRIBUTION and samples actions with full magnitude.
@@ -20,7 +20,7 @@ from r2r_gen2act.modeling.vit import ViTBackbone
 
 
 class FusedQueryFlowPolicy(nn.Module):
-    def __init__(self, vit: ViTBackbone, head: FlowMatchingDiTHead, point_encoder,
+    def __init__(self, vit: ViTBackbone | nn.Module, head: FlowMatchingDiTHead, point_encoder,
                  source_len: int, num_queries: int = 32, segmenter_start: int = 9,
                  ee_dim: int = 4, ee_tokens: int = 8, image_size: int = 224,
                  point_encoder_causal=None, aux_traj_cfg: dict | None = None,
@@ -29,7 +29,9 @@ class FusedQueryFlowPolicy(nn.Module):
                  pad_source: bool = False, wrist_current_enabled: bool = False,
                  separate_stream_queries: bool = False,
                  front_depth_cfg: dict | None = None,
-                 current_history_len: int = 1) -> None:
+                 current_history_len: int = 1,
+                 vae_readout_heads: int = 8,
+                 vae_readout_dropout: float = 0.0) -> None:
         super().__init__()
         # C21: current obs uses all 256 DINOv2 patch tokens (no readout compression) — the current
         # frame is the most action-relevant input, full patches preserve spatial detail.
@@ -49,11 +51,35 @@ class FusedQueryFlowPolicy(nn.Module):
         # sliced [:t] at runtime). max_source_len defaults to source_len (static case).
         self.max_source_len = int(max_source_len) if max_source_len else int(source_len)
         dim = vit.hidden_dim
-        n_blocks = len(self.vit.backend.blocks)
-        self.segmenter_start = int(segmenter_start) % n_blocks if segmenter_start >= 0 else n_blocks + int(segmenter_start)
+        self.vision_encoder_kind = str(getattr(vit, "encoder_kind", "vit"))
+        self.uses_wan_vae = self.vision_encoder_kind == "wan_vae"
+        if self.uses_wan_vae:
+            self.segmenter_start = 0
+        else:
+            n_blocks = len(self.vit.backend.blocks)
+            self.segmenter_start = int(segmenter_start) % n_blocks if segmenter_start >= 0 else n_blocks + int(segmenter_start)
         # ``query`` retains the historical checkpoint key and is the source-video
         # readout. Optional stream-specific queries are warm-started from it.
         self.query = nn.Parameter(torch.randn(self.num_queries, dim) / dim**0.5)
+        if self.uses_wan_vae:
+            latent_dim = int(getattr(self.vit, "latent_dim", 16))
+            readout_heads = int(vae_readout_heads)
+            if readout_heads <= 0 or dim % readout_heads:
+                raise ValueError(
+                    f"Wan-VAE readout heads ({readout_heads}) must divide hidden_dim ({dim})")
+            self.vae_latent_proj = nn.Linear(latent_dim, dim)
+            self.vae_position_proj = nn.Sequential(
+                nn.Linear(3, dim), nn.GELU(), nn.Linear(dim, dim))
+            self.vae_query_time_proj = nn.Sequential(
+                nn.Linear(1, dim), nn.GELU(), nn.Linear(dim, dim))
+            self.vae_latent_norm = nn.LayerNorm(dim)
+            self.vae_query_norm = nn.LayerNorm(dim)
+            self.vae_cross_attn = nn.MultiheadAttention(
+                dim, readout_heads, dropout=float(vae_readout_dropout), batch_first=True)
+            self.vae_ff_norm = nn.LayerNorm(dim)
+            self.vae_ff = nn.Sequential(
+                nn.Linear(dim, 4 * dim), nn.GELU(), nn.Dropout(float(vae_readout_dropout)),
+                nn.Linear(4 * dim, dim))
         self.separate_stream_queries = bool(separate_stream_queries)
         if self.separate_stream_queries:
             self.query_current = nn.Parameter(self.query.detach().clone())
@@ -164,11 +190,67 @@ class FusedQueryFlowPolicy(nn.Module):
             return self.query_wrist
         raise ValueError(f"Unknown or disabled readout stream: {stream_name}")
 
+    @staticmethod
+    def _vae_positions(shape: tuple[int, int, int], device: torch.device,
+                       dtype: torch.dtype) -> torch.Tensor:
+        t, h, w = shape
+        axes = [torch.linspace(-1.0, 1.0, steps=n, device=device, dtype=dtype)
+                if n > 1 else torch.zeros(1, device=device, dtype=dtype)
+                for n in (t, h, w)]
+        return torch.stack(torch.meshgrid(*axes, indexing="ij"), dim=-1).reshape(-1, 3)
+
+    def _wan_readout(self, video: torch.Tensor, time_embed, stream: torch.Tensor,
+                     dt_sec: torch.Tensor | None, pad_to: int | None,
+                     stream_name: str) -> torch.Tensor:
+        b, t, _, _, _ = video.shape
+        latent = self.vit(video)
+        _, _, latent_t, latent_h, latent_w = latent.shape
+        projection_dtype = self.vae_latent_proj.weight.dtype
+        latent_tokens = latent.permute(0, 2, 3, 4, 1).reshape(b, -1, latent.shape[1])
+        latent_tokens = latent_tokens.to(dtype=projection_dtype)
+        positions = self._vae_positions(
+            (latent_t, latent_h, latent_w), latent.device, projection_dtype)
+        latent_tokens = self.vae_latent_norm(
+            self.vae_latent_proj(latent_tokens) + self.vae_position_proj(positions).unsqueeze(0))
+
+        query = self._stream_query(stream_name).view(1, 1, self.num_queries, -1)
+        query = query.expand(b, t, -1, -1)
+        frame_positions = (
+            torch.linspace(-1.0, 1.0, steps=t, device=video.device, dtype=projection_dtype)
+            if t > 1 else torch.zeros(1, device=video.device, dtype=projection_dtype)
+        ).view(1, t, 1, 1)
+        query = query + self.vae_query_time_proj(frame_positions)
+        if time_embed is not None:
+            query = query + time_embed[:t].unsqueeze(0)
+        query = query.reshape(b, t * self.num_queries, -1)
+        cross, _ = self.vae_cross_attn(
+            self.vae_query_norm(query), latent_tokens, latent_tokens, need_weights=False)
+        query = query + cross
+        query = query + self.vae_ff(self.vae_ff_norm(query))
+        query = query.reshape(b, t, self.num_queries, -1)
+
+        if self.dt_time_enabled and dt_sec is not None:
+            query = query + self._dt_embed(dt_sec).unsqueeze(2)
+        n = t
+        if pad_to is not None and t < pad_to:
+            n = int(pad_to)
+            pad = self.pad_frame_embed.expand(b, n - t, self.num_queries, -1)
+            if time_embed is not None:
+                pad = pad + time_embed[t:n].unsqueeze(0)
+            query = torch.cat((query, pad), dim=1)
+        query = query + stream.unsqueeze(0)
+        return query.reshape(b, n * self.num_queries, -1)
+
     def _readout(self, video: torch.Tensor, time_embed, stream: torch.Tensor,
                  dt_sec: torch.Tensor | None = None, pad_to: int | None = None,
                  stream_name: str = "source",
                  patch_geometry: torch.Tensor | None = None) -> torch.Tensor:
         b, t, c, h, w = video.shape
+        if self.uses_wan_vae:
+            if patch_geometry is not None:
+                raise ValueError("Wan-VAE readout does not support DINO-aligned patch geometry")
+            return self._wan_readout(
+                video, time_embed, stream, dt_sec, pad_to, stream_name)
         x = ((video - self.image_mean) / self.image_std).reshape(b * t, c, h, w)
         x, context = self.vit.prepare_tokens(x)
         x = self.vit.run_blocks(x, end=self.segmenter_start, context=context)
@@ -209,6 +291,8 @@ class FusedQueryFlowPolicy(nn.Module):
     def _encode_current_full(self, frame: torch.Tensor, stream: torch.Tensor | None = None) -> torch.Tensor:
         """Encode current obs frame as all 256 DINOv2 patch tokens (no readout-query injection).
         Returns [B, 256, dim] with type_current added."""
+        if self.uses_wan_vae:
+            raise ValueError("current_full_patch is a DINO-only option and cannot be used with Wan-VAE")
         x = (frame - self.image_mean) / self.image_std
         x, context = self.vit.prepare_tokens(x)
         x = self.vit.run_blocks(x, context=context)

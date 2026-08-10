@@ -7,12 +7,16 @@ from r2r_gen2act.modeling.policy import Robot2RobotPolicy
 from r2r_gen2act.modeling.proprioception import ProprioceptionOnlyPolicy
 from r2r_gen2act.modeling.resampler import PerceiverResampler
 from r2r_gen2act.modeling.vit import ViTBackbone
+from r2r_gen2act.modeling.wan_vae import WanVAEBackbone, is_wan_vae_name
 
 
 def build_policy(cfg: dict) -> Robot2RobotPolicy | ProprioceptionOnlyPolicy:
     model_cfg = cfg["model"]
     action_mode = str(cfg.get("action", {}).get("mode", model_cfg.get("action_mode", "classification")))
     model_type = str(model_cfg.get("type", "video_policy"))
+    backbone_name = str((model_cfg.get("backbone", {}) or {}).get("name", "dinov2_vitb14"))
+    if is_wan_vae_name(backbone_name) and model_type != "fused_query_flow":
+        raise ValueError("Wan-VAE is currently supported by model.type=fused_query_flow only")
     if model_type == "fused_flow":
         return _build_fused_flow(cfg)
     if model_type == "query_flow":
@@ -181,14 +185,34 @@ def _build_fused_query_flow(cfg: dict):
 
     model_cfg = cfg["model"]
     backbone_cfg = model_cfg.get("backbone", {})
-    vit = ViTBackbone(
-        name=str(backbone_cfg.get("name", "dinov2_vitb14")),
-        pretrained=bool(backbone_cfg.get("pretrained", True)),
-        image_size=int(model_cfg["image_size"]),
-        hidden_dim=int(model_cfg.get("hidden_dim", 768)),
-        local_checkpoint=str(backbone_cfg.get("local_checkpoint", "") or ""),
-        allow_random_init=bool(backbone_cfg.get("allow_random_init", False)),
-    )
+    backbone_name = str(backbone_cfg.get("name", "dinov2_vitb14"))
+    if is_wan_vae_name(backbone_name):
+        vit = WanVAEBackbone(
+            checkpoint_path=str(backbone_cfg.get("local_checkpoint", "") or ""),
+            hidden_dim=int(model_cfg.get("hidden_dim", 768)),
+            checkpoint_env=str(backbone_cfg.get("checkpoint_env", "WAN_VAE_CHECKPOINT")),
+            backend=str(backbone_cfg.get("backend", "official")),
+            # Do not implicitly import DiffSynth-Studio.  It is only a
+            # compatibility fallback when a Wan config explicitly lists it.
+            fallback_backends=backbone_cfg.get("fallback_backends", []),
+            official_root=str(backbone_cfg.get("official_root", "") or ""),
+            official_root_env=str(backbone_cfg.get("official_root_env", "WAN21_ROOT")),
+            diffusers_model_id=str(backbone_cfg.get("diffusers_model_id", "") or ""),
+            diffsynth_root=str(backbone_cfg.get("diffsynth_root", "") or ""),
+            diffsynth_root_env=str(backbone_cfg.get("diffsynth_root_env", "DIFFSYNTH_ROOT")),
+            dtype=str(backbone_cfg.get("dtype", "bfloat16")),
+            latent_dim=int(backbone_cfg.get("latent_dim", 16)),
+        )
+        print(f"[fused_query_flow] Wan-VAE backend={vit.backend} checkpoint={vit.checkpoint_path}")
+    else:
+        vit = ViTBackbone(
+            name=backbone_name,
+            pretrained=bool(backbone_cfg.get("pretrained", True)),
+            image_size=int(model_cfg["image_size"]),
+            hidden_dim=int(model_cfg.get("hidden_dim", 768)),
+            local_checkpoint=str(backbone_cfg.get("local_checkpoint", "") or ""),
+            allow_random_init=bool(backbone_cfg.get("allow_random_init", False)),
+        )
     dim = vit.hidden_dim
     pose_dims = int(model_cfg.get("pose_action_dims", 9))
     qr = model_cfg.get("query_readout", {}) or {}
@@ -249,11 +273,14 @@ def _build_fused_query_flow(cfg: dict):
         separate_stream_queries=bool(qr.get("separate_streams", False)),
         front_depth_cfg=model_cfg.get("front_depth", {}) or {},
         current_history_len=len(cfg.get("data", {}).get("current_history_offsets", [0])),
+        vae_readout_heads=int(qr.get("heads", 8)),
+        vae_readout_dropout=float(qr.get("dropout", 0.0)),
     )
     n_tr = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[fused_query_flow] total={sum(p.numel() for p in model.parameters())/1e6:.1f}M trainable={n_tr/1e6:.1f}M "
           f"head={sum(p.numel() for p in head.parameters())/1e6:.1f}M point_seq={point_seq} causal={causal_on} "
-        f"num_eval_samples={int(fd.get('num_eval_samples', 1))} diffuse_gripper={diffuse_gripper}")
+          f"num_eval_samples={int(fd.get('num_eval_samples', 1))} diffuse_gripper={diffuse_gripper} "
+          f"vision={backbone_name}")
     return model
 
 

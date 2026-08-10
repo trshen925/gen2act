@@ -1,0 +1,49 @@
+# Raw-DROID Gen2Act with the frozen Wan 2.1 video VAE replacing DINO.
+# Official Wan2.1 code and official Wan2.1_VAE.pth are the default. DiffSynth is
+# only tried as an explicit compatibility fallback when official loading fails.
+# Set WAN21_ROOT=/path/to/Wan2.1 and WAN_VAE_CHECKPOINT=/path/to/Wan2.1_VAE.pth.
+_base_: droidFULL_C40_jointvelocity_pi05_letterbox_fulltrain.yaml
+
+experiment:
+  name: droidFULL_wanvae_jointvelocity_pi05_letterbox_fulltrain
+  output_dir: outputs/droidFULL_wanvae_jointvelocity_pi05_letterbox_fulltrain
+
+model:
+  backbone:
+    name: wan_vae
+    pretrained: true
+    freeze: true
+    local_checkpoint: ""
+    checkpoint_env: WAN_VAE_CHECKPOINT
+    backend: official
+    fallback_backends: [diffsynth]
+    official_root: ""
+    official_root_env: WAN21_ROOT
+    # Only needed if the official loader is unavailable and fallback is used.
+    diffsynth_root: ""
+    diffsynth_root_env: DIFFSYNTH_ROOT
+    dtype: bfloat16
+    latent_dim: 16
+  query_readout:
+    # The VAE adapter returns the same 32 tokens per input frame as the DINO path.
+    num_queries: 32
+    heads: 8
+    dropout: 0.1
+
+train:
+  # DINO readout weights are structurally incompatible; train the Wan adapter
+  # and action model as a new run.
+  resume_checkpoint: null
+  resume_full_checkpoint: null
+  resume_exclude_prefixes: []
+  optimizer:
+    # Wan-VAE is frozen, so every trainable parameter uses the head LR.
+    backbone_lr_multiplier: 1.0
+    llrd: 1.0
+  logging:
+    wandb:
+      # Authenticate with WANDB_API_KEY; do not inherit another user's credential path.
+      credential: ""
+      entity: ""
+      group: wanvae_raw_droid
+      name: droidFULL_wanvae_jointvelocity_pi05_letterbox_fulltrain

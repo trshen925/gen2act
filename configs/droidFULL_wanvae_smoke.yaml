@@ -1,0 +1,34 @@
+_base_: droidFULL_wanvae_jointvelocity_pi05_letterbox_fulltrain.yaml
+
+experiment:
+  name: wanvae_smoke
+  output_dir: outputs/wanvae_smoke
+
+data:
+  root: /mnt/afs/dongyifei/DreamFlyWheel/gen2act/artifacts/droid100_raw_smoke
+  filter_manifest: /mnt/afs/dongyifei/DreamFlyWheel/gen2act/artifacts/droid100_raw_smoke_pi05_manifest.json
+  max_episodes: 16
+  max_windows: 64
+  val_count: 2
+  validate_manifest_paths: true
+  native_action_sampling:
+    enabled: false
+  wrist_current:
+    raw_root: /mnt/afs/dongyifei/DreamFlyWheel/gen2act/artifacts/droid100_raw_smoke
+
+model:
+  backbone:
+    # Smoke test 必须强制使用 official backend，不能静默回退。
+    fallback_backends: []
+
+train:
+  batch_size: 1
+  epochs: 1
+  num_workers: 0
+  persistent_workers: false
+  logging:
+    log_every: 1
+    wandb:
+      enabled: false
+  checkpoint:
+    every_steps: 0
