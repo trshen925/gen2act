@@ -48,6 +48,21 @@ def validate_config(cfg: dict) -> None:
     backbone = model.get("backbone", {}) or {}
     backbone_name = str(backbone.get("name", "dinov2_vitb14")).lower()
     wan_names = {"wan_vae", "wan2.1_vae", "wan2_1_vae", "wan_video_vae"}
+    source_micro_clip = data.get("source_micro_clip", {}) or {}
+    source_micro_clip_enabled = bool(source_micro_clip.get("enabled", False))
+    if source_micro_clip_enabled:
+        frames = int(source_micro_clip.get("frames", 1))
+        stride = int(source_micro_clip.get("stride", 1))
+        alignment = str(source_micro_clip.get("alignment", "causal"))
+        if backbone_name not in wan_names:
+            raise ValueError("data.source_micro_clip currently requires a Wan-VAE backbone")
+        if frames <= 1 or (frames - 1) % 4:
+            raise ValueError(
+                "Wan source_micro_clip.frames must be a legal temporal length 1+4n and >1")
+        if stride <= 0:
+            raise ValueError("data.source_micro_clip.stride must be positive")
+        if alignment != "causal":
+            raise ValueError("data.source_micro_clip.alignment currently supports only causal")
     if backbone_name in wan_names:
         if str(model.get("type", "video_policy")) != "fused_query_flow":
             raise ValueError("Wan-VAE requires model.type=fused_query_flow")
