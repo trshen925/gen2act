@@ -25,7 +25,8 @@ model:
     dtype: bfloat16
     latent_dim: 16
   query_readout:
-    # The VAE adapter returns the same 32 tokens per input frame as the DINO path.
+    # Each sparse source/current/wrist frame is encoded as an independent T=1
+    # Wan clip, then read out into the same 32-token-per-frame interface as DINO.
     num_queries: 32
     heads: 8
     dropout: 0.1
