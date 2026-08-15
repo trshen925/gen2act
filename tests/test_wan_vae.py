@@ -20,7 +20,12 @@ class _FakeWanBackbone(nn.Module):
     hidden_dim = 32
     latent_dim = 3
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.last_input_shape: tuple[int, ...] | None = None
+
     def forward(self, video: torch.Tensor) -> torch.Tensor:
+        self.last_input_shape = tuple(video.shape)
         pixels = video.transpose(1, 2)
         return F.avg_pool3d(pixels, kernel_size=(1, 8, 8), stride=(4, 8, 8))
 
@@ -141,8 +146,9 @@ def test_diffsynth_is_used_only_when_listed_as_fallback(tmp_path: Path) -> None:
 
 
 def test_fused_policy_resamples_wan_latents_to_per_frame_queries() -> None:
+    backbone = _FakeWanBackbone()
     policy = FusedQueryFlowPolicy(
-        _FakeWanBackbone(), _UnusedHead(), None, source_len=5,
+        backbone, _UnusedHead(), None, source_len=5,
         num_queries=3, ee_dim=2, ee_tokens=1, vae_readout_heads=4,
         dt_time_cfg={"enabled": True, "num_freqs": 2, "max_sec": 2.0},
     )
@@ -155,8 +161,30 @@ def test_fused_policy_resamples_wan_latents_to_per_frame_queries() -> None:
     tokens.sum().backward()
 
     assert tokens.shape == (2, 15, 32)
+    assert backbone.last_input_shape == (10, 1, 3, 16, 24)
     assert policy.vae_latent_proj.weight.grad is not None
     assert policy.query.grad is not None
+
+
+def test_fused_policy_wan_readout_keeps_frames_independent() -> None:
+    policy = FusedQueryFlowPolicy(
+        _FakeWanBackbone(), _UnusedHead(), None, source_len=3,
+        num_queries=2, ee_dim=2, ee_tokens=1, vae_readout_heads=4,
+    ).eval()
+    video = torch.rand(1, 3, 3, 16, 16)
+
+    before = policy._readout(
+        video, policy.source_time_embed, policy.type_source,
+        stream_name="source").reshape(1, 3, 2, 32)
+    changed = video.clone()
+    changed[:, 1] = 1.0 - changed[:, 1]
+    after = policy._readout(
+        changed, policy.source_time_embed, policy.type_source,
+        stream_name="source").reshape(1, 3, 2, 32)
+
+    torch.testing.assert_close(after[:, 0], before[:, 0])
+    torch.testing.assert_close(after[:, 2], before[:, 2])
+    assert not torch.allclose(after[:, 1], before[:, 1])
 
 
 def test_config_validation_rejects_invalid_wan_backends() -> None:

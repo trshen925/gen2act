@@ -202,11 +202,21 @@ class FusedQueryFlowPolicy(nn.Module):
     def _wan_readout(self, video: torch.Tensor, time_embed, stream: torch.Tensor,
                      dt_sec: torch.Tensor | None, pad_to: int | None,
                      stream_name: str) -> torch.Tensor:
-        b, t, _, _, _ = video.shape
-        latent = self.vit(video)
+        b, t, c, h, w = video.shape
+        # The source frames are sparse anchors sampled across a long episode, not
+        # adjacent video frames. Encode every anchor as its own T=1 clip so Wan's
+        # causal temporal convolutions cannot interpret the large gaps as local
+        # motion. Folding T into the batch keeps the VAE call vectorized while
+        # preserving exact frame-to-latent correspondence.
+        frame_video = video.reshape(b * t, 1, c, h, w)
+        latent = self.vit(frame_video)
         _, _, latent_t, latent_h, latent_w = latent.shape
+        if latent.shape[0] != b * t:
+            raise RuntimeError(
+                f"Framewise Wan-VAE returned batch {latent.shape[0]}; expected {b * t}")
         projection_dtype = self.vae_latent_proj.weight.dtype
-        latent_tokens = latent.permute(0, 2, 3, 4, 1).reshape(b, -1, latent.shape[1])
+        latent_tokens = latent.permute(0, 2, 3, 4, 1).reshape(
+            b * t, latent_t * latent_h * latent_w, latent.shape[1])
         latent_tokens = latent_tokens.to(dtype=projection_dtype)
         positions = self._vae_positions(
             (latent_t, latent_h, latent_w), latent.device, projection_dtype)
@@ -222,7 +232,7 @@ class FusedQueryFlowPolicy(nn.Module):
         query = query + self.vae_query_time_proj(frame_positions)
         if time_embed is not None:
             query = query + time_embed[:t].unsqueeze(0)
-        query = query.reshape(b, t * self.num_queries, -1)
+        query = query.reshape(b * t, self.num_queries, -1)
         cross, _ = self.vae_cross_attn(
             self.vae_query_norm(query), latent_tokens, latent_tokens, need_weights=False)
         query = query + cross
