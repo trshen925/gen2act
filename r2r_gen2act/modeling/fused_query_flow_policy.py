@@ -202,21 +202,28 @@ class FusedQueryFlowPolicy(nn.Module):
     def _wan_readout(self, video: torch.Tensor, time_embed, stream: torch.Tensor,
                      dt_sec: torch.Tensor | None, pad_to: int | None,
                      stream_name: str) -> torch.Tensor:
-        b, t, c, h, w = video.shape
-        # The source frames are sparse anchors sampled across a long episode, not
-        # adjacent video frames. Encode every anchor as its own T=1 clip so Wan's
-        # causal temporal convolutions cannot interpret the large gaps as local
-        # motion. Folding T into the batch keeps the VAE call vectorized while
-        # preserving exact frame-to-latent correspondence.
-        frame_video = video.reshape(b * t, 1, c, h, w)
-        latent = self.vit(frame_video)
+        if video.ndim == 5:
+            # Current/wrist and the legacy source path: K independent T=1 clips.
+            b, anchors, c, h, w = video.shape
+            clip_frames = 1
+            micro_clips = video.reshape(b * anchors, clip_frames, c, h, w)
+        elif video.ndim == 6:
+            # Source micro-clips: [B,K,T,C,H,W] -> [B*K,T,C,H,W].  K remains the
+            # macro timeline while Wan models the local continuous T-frame motion.
+            b, anchors, clip_frames, c, h, w = video.shape
+            micro_clips = video.reshape(b * anchors, clip_frames, c, h, w)
+        else:
+            raise ValueError(
+                "Wan-VAE readout expects [B,K,C,H,W] or [B,K,T,C,H,W], "
+                f"got {tuple(video.shape)}")
+        latent = self.vit(micro_clips)
         _, _, latent_t, latent_h, latent_w = latent.shape
-        if latent.shape[0] != b * t:
+        if latent.shape[0] != b * anchors:
             raise RuntimeError(
-                f"Framewise Wan-VAE returned batch {latent.shape[0]}; expected {b * t}")
+                f"Wan-VAE micro-clip batch {latent.shape[0]}; expected {b * anchors}")
         projection_dtype = self.vae_latent_proj.weight.dtype
         latent_tokens = latent.permute(0, 2, 3, 4, 1).reshape(
-            b * t, latent_t * latent_h * latent_w, latent.shape[1])
+            b * anchors, latent_t * latent_h * latent_w, latent.shape[1])
         latent_tokens = latent_tokens.to(dtype=projection_dtype)
         positions = self._vae_positions(
             (latent_t, latent_h, latent_w), latent.device, projection_dtype)
@@ -224,29 +231,29 @@ class FusedQueryFlowPolicy(nn.Module):
             self.vae_latent_proj(latent_tokens) + self.vae_position_proj(positions).unsqueeze(0))
 
         query = self._stream_query(stream_name).view(1, 1, self.num_queries, -1)
-        query = query.expand(b, t, -1, -1)
+        query = query.expand(b, anchors, -1, -1)
         frame_positions = (
-            torch.linspace(-1.0, 1.0, steps=t, device=video.device, dtype=projection_dtype)
-            if t > 1 else torch.zeros(1, device=video.device, dtype=projection_dtype)
-        ).view(1, t, 1, 1)
+            torch.linspace(-1.0, 1.0, steps=anchors, device=video.device, dtype=projection_dtype)
+            if anchors > 1 else torch.zeros(1, device=video.device, dtype=projection_dtype)
+        ).view(1, anchors, 1, 1)
         query = query + self.vae_query_time_proj(frame_positions)
         if time_embed is not None:
-            query = query + time_embed[:t].unsqueeze(0)
-        query = query.reshape(b * t, self.num_queries, -1)
+            query = query + time_embed[:anchors].unsqueeze(0)
+        query = query.reshape(b * anchors, self.num_queries, -1)
         cross, _ = self.vae_cross_attn(
             self.vae_query_norm(query), latent_tokens, latent_tokens, need_weights=False)
         query = query + cross
         query = query + self.vae_ff(self.vae_ff_norm(query))
-        query = query.reshape(b, t, self.num_queries, -1)
+        query = query.reshape(b, anchors, self.num_queries, -1)
 
         if self.dt_time_enabled and dt_sec is not None:
             query = query + self._dt_embed(dt_sec).unsqueeze(2)
-        n = t
-        if pad_to is not None and t < pad_to:
+        n = anchors
+        if pad_to is not None and anchors < pad_to:
             n = int(pad_to)
-            pad = self.pad_frame_embed.expand(b, n - t, self.num_queries, -1)
+            pad = self.pad_frame_embed.expand(b, n - anchors, self.num_queries, -1)
             if time_embed is not None:
-                pad = pad + time_embed[t:n].unsqueeze(0)
+                pad = pad + time_embed[anchors:n].unsqueeze(0)
             query = torch.cat((query, pad), dim=1)
         query = query + stream.unsqueeze(0)
         return query.reshape(b, n * self.num_queries, -1)
@@ -255,12 +262,14 @@ class FusedQueryFlowPolicy(nn.Module):
                  dt_sec: torch.Tensor | None = None, pad_to: int | None = None,
                  stream_name: str = "source",
                  patch_geometry: torch.Tensor | None = None) -> torch.Tensor:
-        b, t, c, h, w = video.shape
         if self.uses_wan_vae:
             if patch_geometry is not None:
                 raise ValueError("Wan-VAE readout does not support DINO-aligned patch geometry")
             return self._wan_readout(
                 video, time_embed, stream, dt_sec, pad_to, stream_name)
+        if video.ndim != 5:
+            raise ValueError(f"DINO readout expects [B,T,C,H,W], got {tuple(video.shape)}")
+        b, t, c, h, w = video.shape
         x = ((video - self.image_mean) / self.image_std).reshape(b * t, c, h, w)
         x, context = self.vit.prepare_tokens(x)
         x = self.vit.run_blocks(x, end=self.segmenter_start, context=context)

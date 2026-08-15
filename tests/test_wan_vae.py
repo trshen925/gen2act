@@ -11,6 +11,8 @@ import torch.nn.functional as F
 
 from r2r_gen2act.config.load import default_config
 from r2r_gen2act.config.schema import validate_config
+from r2r_gen2act.data.adapters.base import WindowedRobotDataset
+from r2r_gen2act.data.types import EpisodeRecord
 from r2r_gen2act.modeling.fused_query_flow_policy import FusedQueryFlowPolicy
 from r2r_gen2act.modeling.wan_vae import WanVAEBackbone
 
@@ -187,6 +189,60 @@ def test_fused_policy_wan_readout_keeps_frames_independent() -> None:
     assert not torch.allclose(after[:, 1], before[:, 1])
 
 
+def test_source_micro_clips_are_sorted_and_read_in_one_40_frame_request() -> None:
+    dataset = object.__new__(WindowedRobotDataset)
+    dataset.source_micro_clip_enabled = True
+    dataset.source_micro_clip_frames = 5
+    dataset.source_micro_clip_stride = 1
+    dataset.source_micro_clip_alignment = "causal"
+    episode = EpisodeRecord(
+        "ep", 100, Path("front.mp4"), Path("front.mp4"), Path("metadata.json"))
+    anchors = [2, 12, 22, 32, 42, 52, 62, 72]
+    calls: list[list[int]] = []
+
+    def read_once(path: Path, indices: list[int]) -> torch.Tensor:
+        assert path == episode.source_video_path
+        calls.append(list(indices))
+        return torch.as_tensor(indices, dtype=torch.float32).view(-1, 1, 1, 1)
+
+    dataset._read_video_indices = read_once
+    frames = dataset._read_source_indices(episode, anchors)
+
+    assert len(calls) == 1
+    assert len(calls[0]) == 40
+    assert calls[0] == sorted(calls[0])
+    assert frames.shape == (8, 5, 1, 1, 1)
+    assert frames[:, -1, 0, 0, 0].tolist() == anchors
+    assert frames[0, :, 0, 0, 0].tolist() == [0.0, 0.0, 0.0, 1.0, 2.0]
+
+
+def test_fused_policy_wan_readout_encodes_eight_five_frame_microclips() -> None:
+    backbone = _FakeWanBackbone()
+    policy = FusedQueryFlowPolicy(
+        backbone, _UnusedHead(), None, source_len=8,
+        num_queries=3, ee_dim=2, ee_tokens=1, vae_readout_heads=4,
+        dt_time_cfg={"enabled": True, "num_freqs": 2, "max_sec": 2.0},
+    ).eval()
+    video = torch.rand(2, 8, 5, 3, 16, 24)
+    source_dt = torch.rand(2, 8)
+
+    before = policy._readout(
+        video, policy.source_time_embed, policy.type_source, source_dt,
+        stream_name="source").reshape(2, 8, 3, 32)
+    assert backbone.last_input_shape == (16, 5, 3, 16, 24)
+    assert before.shape == (2, 8, 3, 32)
+
+    changed = video.clone()
+    changed[:, 4, -1] = 1.0 - changed[:, 4, -1]
+    after = policy._readout(
+        changed, policy.source_time_embed, policy.type_source, source_dt,
+        stream_name="source").reshape(2, 8, 3, 32)
+
+    torch.testing.assert_close(after[:, :4], before[:, :4])
+    torch.testing.assert_close(after[:, 5:], before[:, 5:])
+    assert not torch.allclose(after[:, 4], before[:, 4])
+
+
 def test_config_validation_rejects_invalid_wan_backends() -> None:
     cfg = default_config()
     cfg["model"]["type"] = "fused_query_flow"
@@ -202,3 +258,18 @@ def test_config_validation_rejects_invalid_wan_backends() -> None:
     cfg["model"]["front_depth"] = {"enabled": True}
     with pytest.raises(ValueError, match="patch geometry"):
         validate_config(cfg)
+
+
+def test_config_validation_accepts_wan_five_frame_microclips() -> None:
+    cfg = default_config()
+    cfg["model"]["type"] = "fused_query_flow"
+    cfg["model"]["backbone"].update({
+        "name": "wan_vae", "pretrained": True, "freeze": True,
+        "dtype": "bfloat16", "latent_dim": 16, "backend": "official",
+    })
+    cfg["model"]["query_readout"] = {"heads": 8}
+    cfg["data"]["source_micro_clip"] = {
+        "enabled": True, "frames": 5, "stride": 1, "alignment": "causal",
+    }
+
+    validate_config(cfg)

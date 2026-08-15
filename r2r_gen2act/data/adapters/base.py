@@ -28,6 +28,12 @@ class WindowedRobotDataset(Dataset):
         self.data_cfg = cfg["data"]
         self.split = split
         self.source_len = int(self.data_cfg["source_len"])
+        source_micro_clip_cfg = self.data_cfg.get("source_micro_clip", {}) or {}
+        self.source_micro_clip_enabled = bool(source_micro_clip_cfg.get("enabled", False))
+        self.source_micro_clip_frames = int(source_micro_clip_cfg.get("frames", 1))
+        self.source_micro_clip_stride = int(source_micro_clip_cfg.get("stride", 1))
+        self.source_micro_clip_alignment = str(
+            source_micro_clip_cfg.get("alignment", "causal"))
         self.target_history_len = int(self.data_cfg["target_history_len"])
         self.target_offset = int(self.data_cfg.get("target_offset", 0))
         self.future_horizon = int(self.data_cfg.get("future_horizon", 0))
@@ -656,8 +662,82 @@ class WindowedRobotDataset(Dataset):
 
     def _read_source_video(self, episode: EpisodeRecord, start_index: int) -> torch.Tensor:
         indices = self._compute_source_indices(episode, start_index)
-        return self._read_video_indices(
-            episode.source_video_path, self._front_video_indices(episode, indices))
+        return self._read_source_indices(episode, indices)
+
+    def _source_frame_groups(
+        self, episode: EpisodeRecord, anchor_indices: list[int]
+    ) -> list[list[int]]:
+        """Expand macro source anchors into causal local micro-clips.
+
+        The normal path returns one frame per anchor.  When ``source_micro_clip``
+        is enabled, anchor ``a`` represents the consecutive causal clip ending
+        at ``a``.  Boundary frames are repeated so every anchor has a fixed
+        number of frames and the batch remains collatable.
+        """
+        if not bool(getattr(self, "source_micro_clip_enabled", False)):
+            return [[int(index)] for index in anchor_indices]
+        alignment = str(getattr(self, "source_micro_clip_alignment", "causal"))
+        if alignment != "causal":
+            raise ValueError(
+                f"Unsupported source_micro_clip.alignment={alignment!r}")
+        last = max(0, int(episode.num_steps) - 1)
+        frames = int(getattr(self, "source_micro_clip_frames", 1))
+        stride = int(getattr(self, "source_micro_clip_stride", 1))
+        offsets = [-(frames - 1 - position) * stride for position in range(frames)]
+        return [
+            [min(max(0, int(anchor) + offset), last) for offset in offsets]
+            for anchor in anchor_indices
+        ]
+
+    def _source_frame_plan(
+        self, episode: EpisodeRecord, anchor_indices: list[int]
+    ) -> tuple[list[int], list[int], int]:
+        """Return one sorted read plan for all source micro-clip frames.
+
+        ``restore`` maps the sorted read result back to anchor-major order.  For
+        the Wan ``8 x T=5`` path this sorts all 40 logical frame indices before
+        the video reader is called, so extraction happens in one forward-ordered
+        request instead of eight independent five-frame requests.
+        """
+        groups = self._source_frame_groups(episode, anchor_indices)
+        clip_frames = len(groups[0]) if groups else 1
+        flat = [index for group in groups for index in group]
+        order = sorted(range(len(flat)), key=lambda position: (flat[position], position))
+        sorted_indices = [flat[position] for position in order]
+        restore = [0] * len(order)
+        for sorted_position, original_position in enumerate(order):
+            restore[original_position] = sorted_position
+        return sorted_indices, restore, clip_frames
+
+    @staticmethod
+    def _restore_source_frame_plan(
+        sorted_frames: torch.Tensor,
+        restore: list[int],
+        num_anchors: int,
+        clip_frames: int,
+    ) -> torch.Tensor:
+        if restore:
+            restored = sorted_frames[torch.as_tensor(
+                restore, dtype=torch.long, device=sorted_frames.device)]
+        else:
+            restored = sorted_frames
+        restored = restored.reshape(num_anchors, clip_frames, *sorted_frames.shape[1:])
+        # Preserve the historical [K,C,H,W] dataset interface outside micro-clip mode.
+        return restored[:, 0] if clip_frames == 1 else restored
+
+    def _read_source_indices(
+        self, episode: EpisodeRecord, anchor_indices: list[int]
+    ) -> torch.Tensor:
+        if episode.source_video_path is None:
+            raise ValueError(f"Episode {episode.episode_id} has no source video")
+        sorted_indices, restore, clip_frames = self._source_frame_plan(
+            episode, anchor_indices)
+        sorted_frames = self._read_video_indices(
+            episode.source_video_path,
+            self._front_video_indices(episode, sorted_indices),
+        )
+        return self._restore_source_frame_plan(
+            sorted_frames, restore, len(anchor_indices), clip_frames)
 
     @staticmethod
     def _front_video_indices(episode: EpisodeRecord, indices: list[int]) -> list[int]:
@@ -899,10 +979,7 @@ class WindowedRobotDataset(Dataset):
             else:
                 _src_idx = self._compute_source_indices(episode, start_index)
             if not self.front_translation_enabled:
-                source_video = self._read_video_indices(
-                    episode.source_video_path,
-                    self._front_video_indices(episode, _src_idx),
-                )
+                source_video = self._read_source_indices(episode, _src_idx)
             # C20: per-frame Δt (real seconds since previous sampled frame; first frame = 0). Lets the
             # model tell a fast short demo from a slow long one (same 8 frames, different pacing).
             if self.dt_time_enabled and _src_idx is not None:
@@ -917,17 +994,22 @@ class WindowedRobotDataset(Dataset):
                 front_dy = float((torch.rand(()) * 2.0 - 1.0) * max_y)
             if self.front_translation_enabled:
                 target_indices = [int(target_step) + offset for offset in self.current_history_offsets]
+                source_sorted_indices, source_restore, source_clip_frames = self._source_frame_plan(
+                    episode, _src_idx)
                 # Source and current use the same front MP4. Decode their union in
                 # ascending order so the ffmpeg reader never seeks backwards
-                # between two independent requests for the same sample.
-                combined_indices = sorted(set(target_indices + [int(index) for index in _src_idx]))
+                # between two independent requests for the same sample.  The full
+                # 40-frame micro-clip plan is sorted before this single extraction.
+                combined_indices = sorted(set(target_indices + source_sorted_indices))
                 combined = self._read_front_with_translation(
                     episode, combined_indices, front_dx, front_dy)
                 positions = {index: position for position, index in enumerate(combined_indices)}
                 target_history = torch.stack(
                     [combined[positions[index]] for index in target_indices], dim=0)
-                source_video = torch.stack(
-                    [combined[positions[int(index)]] for index in _src_idx], dim=0)
+                source_sorted_frames = torch.stack(
+                    [combined[positions[index]] for index in source_sorted_indices], dim=0)
+                source_video = self._restore_source_frame_plan(
+                    source_sorted_frames, source_restore, len(_src_idx), source_clip_frames)
             else:
                 target_history = self._read_target_history(episode, start_index)
             if self.split == "train":
@@ -940,7 +1022,19 @@ class WindowedRobotDataset(Dataset):
                     cam_pos = action[:, :3] if action.ndim == 2 else None
                     ee_fracs = (self._future_traj_ee_image_fracs(payload, cam_pos)
                                 if cam_pos is not None else None)
-                    source_video = apply_structural_augmentation(source_video, self.struct_aug_cfg, ee_fracs)
+                    if source_video.ndim == 5:
+                        anchors, clip_frames = source_video.shape[:2]
+                        flat_source = source_video.reshape(
+                            anchors * clip_frames, *source_video.shape[2:])
+                        flat_ee_fracs = (
+                            np.repeat(ee_fracs, clip_frames, axis=0)
+                            if ee_fracs is not None else None
+                        )
+                        source_video = apply_structural_augmentation(
+                            flat_source, self.struct_aug_cfg, flat_ee_fracs).reshape_as(source_video)
+                    else:
+                        source_video = apply_structural_augmentation(
+                            source_video, self.struct_aug_cfg, ee_fracs)
             sample["source_video"] = source_video
             sample["target_history"] = target_history
             if self.wrist_current_enabled:

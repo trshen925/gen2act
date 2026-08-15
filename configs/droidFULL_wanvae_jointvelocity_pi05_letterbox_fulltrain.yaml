@@ -8,6 +8,16 @@ experiment:
   name: droidFULL_wanvae_jointvelocity_pi05_letterbox_fulltrain
   output_dir: outputs/droidFULL_wanvae_jointvelocity_pi05_letterbox_fulltrain
 
+data:
+  # Eight long-range anchors, each represented by the five consecutive 15 Hz
+  # frames ending at that anchor. The dataset sorts all 40 source indices and
+  # extracts them in one video-reader request before restoring [8,5,C,H,W].
+  source_micro_clip:
+    enabled: true
+    frames: 5
+    stride: 1
+    alignment: causal
+
 model:
   backbone:
     name: wan_vae
@@ -25,8 +35,8 @@ model:
     dtype: bfloat16
     latent_dim: 16
   query_readout:
-    # Each sparse source/current/wrist frame is encoded as an independent T=1
-    # Wan clip, then read out into the same 32-token-per-frame interface as DINO.
+    # Source uses 8 independent T=5 local clips. Current/wrist remain T=1. Each
+    # macro source anchor still emits 32 tokens, preserving the 8*32 interface.
     num_queries: 32
     heads: 8
     dropout: 0.1
