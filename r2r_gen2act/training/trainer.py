@@ -226,6 +226,80 @@ def _amp_dtype(cfg: dict) -> torch.dtype:
     return {"bfloat16": torch.bfloat16, "bf16": torch.bfloat16, "float16": torch.float16, "fp16": torch.float16}.get(name, torch.bfloat16)
 
 
+def _batch_size(batch: dict) -> int:
+    preferred = batch.get("action")
+    if isinstance(preferred, torch.Tensor) and preferred.ndim > 0:
+        return int(preferred.shape[0])
+    for value in batch.values():
+        if isinstance(value, torch.Tensor) and value.ndim > 0:
+            return int(value.shape[0])
+    raise ValueError("Could not infer batch size from a batch without tensor values")
+
+
+def _slice_batch(batch: dict, start: int, end: int, batch_size: int) -> dict:
+    """Slice batched values while preserving scalar/shared metadata."""
+
+    def slice_value(value):
+        if isinstance(value, torch.Tensor):
+            return value[start:end] if value.ndim > 0 and value.shape[0] == batch_size else value
+        if isinstance(value, dict):
+            return {key: slice_value(child) for key, child in value.items()}
+        if isinstance(value, list) and len(value) == batch_size:
+            return value[start:end]
+        if isinstance(value, tuple) and len(value) == batch_size:
+            return value[start:end]
+        return value
+
+    return {key: slice_value(value) for key, value in batch.items()}
+
+
+def _compute_batch_losses(
+    model, batch, codec, cfg, device, *, train: bool
+) -> dict[str, torch.Tensor]:
+    proprioception = batch.get("proprioception")
+    action_target = None
+    if train and str(cfg.get("action", {}).get("mode", "")) == "flow":
+        # Flow matching needs the normalized pose chunk to build the target.
+        pose_dims = codec.pose_dims
+        action_target = codec.normalize(batch["action"][..., :pose_dims].to(device))
+        if bool(cfg["model"].get("flow_dit", {}).get("diffuse_gripper", False)):
+            gripper_cfg = cfg.get("action", {}).get("gripper", {}) or {}
+            continuous = bool(gripper_cfg.get("continuous", False))
+            gripper_key = "gripper_value" if continuous else "gripper"
+            gripper = batch[gripper_key].to(
+                device=device, dtype=action_target.dtype).unsqueeze(-1)
+            gripper = codec.normalize_scalar(
+                gripper,
+                float(gripper_cfg.get("bounds_low", 0.0)),
+                float(gripper_cfg.get("bounds_high", 1.0)),
+            )
+            action_target = torch.cat((action_target, gripper), dim=-1)
+    point_track = batch.get("point_track")
+    extra = {}
+    ptc = batch.get("point_track_causal")
+    if ptc is not None:
+        extra["point_track_causal"] = ptc
+    dv = batch.get("depth_video")
+    if dv is not None:
+        extra["depth_video"] = dv.float()
+    ck = batch.get("camera_K")
+    if ck is not None:
+        extra["camera_K"] = ck
+    front_geometry = batch.get("front_geometry")
+    if front_geometry is not None:
+        extra["front_geometry"] = front_geometry
+    sdt = batch.get("source_dt")
+    if sdt is not None:
+        extra["source_dt"] = sdt.to(device)
+    wrist = batch.get("wrist_current")
+    if wrist is not None:
+        extra["wrist_current"] = wrist
+    outputs = model(
+        batch.get("source_video"), batch.get("target_history"), proprioception,
+        action_target, point_track, **extra)
+    return compute_losses(outputs, batch, codec, cfg)
+
+
 def _build_scheduler(optimizer, cfg: dict, steps_per_epoch: int):
     sch_cfg = cfg["train"].get("scheduler", {})
     name = str(sch_cfg.get("name", "none")).lower()
@@ -296,63 +370,49 @@ def run_epoch(
     amp_dtype = _amp_dtype(cfg)
     for batch in loader:
         batch = _move_batch(batch, device)
-        with torch.set_grad_enabled(train):
-            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-                proprioception = batch.get("proprioception")
-                action_target = None
-                if train and str(cfg.get("action", {}).get("mode", "")) == "flow":
-                    # flow-matching head needs the normalized pose chunk to build the flow target;
-                    # eval samples from noise so no target is passed.
-                    pose_dims = codec.pose_dims
-                    action_target = codec.normalize(batch["action"][..., :pose_dims].to(device))
-                    if bool(cfg["model"].get("flow_dit", {}).get("diffuse_gripper", False)):
-                        gripper_cfg = cfg.get("action", {}).get("gripper", {}) or {}
-                        continuous = bool(gripper_cfg.get("continuous", False))
-                        gripper_key = "gripper_value" if continuous else "gripper"
-                        gripper = batch[gripper_key].to(device=device, dtype=action_target.dtype).unsqueeze(-1)
-                        gripper = codec.normalize_scalar(
-                            gripper,
-                            float(gripper_cfg.get("bounds_low", 0.0)),
-                            float(gripper_cfg.get("bounds_high", 1.0)),
-                        )
-                        action_target = torch.cat((action_target, gripper), dim=-1)
-                point_track = batch.get("point_track")
-                extra = {}
-                ptc = batch.get("point_track_causal")
-                if ptc is not None:
-                    extra["point_track_causal"] = ptc
-                # C11 depth 3D lifting: pass depth frames + camera intrinsics when available
-                dv = batch.get("depth_video")
-                if dv is not None:
-                    extra["depth_video"] = dv.float()
-                ck = batch.get("camera_K")
-                if ck is not None:
-                    extra["camera_K"] = ck
-                front_geometry = batch.get("front_geometry")
-                if front_geometry is not None:
-                    extra["front_geometry"] = front_geometry
-                # C20: per-frame Δt (source-video pacing) for the flow policy's Δt time-conditioning
-                sdt = batch.get("source_dt")
-                if sdt is not None:
-                    extra["source_dt"] = sdt.to(device)
-                wrist = batch.get("wrist_current")
-                if wrist is not None:
-                    extra["wrist_current"] = wrist
-                outputs = model(batch.get("source_video"), batch.get("target_history"), proprioception, action_target, point_track, **extra)
-                losses = compute_losses(outputs, batch, codec, cfg)
-                if not torch.isfinite(losses["loss"]):
-                    raise FloatingPointError(f"Non-finite loss in {'train' if train else 'val'} epoch step {steps}: {float(losses['loss'].detach().cpu())}")
-            if train:
-                optimizer.zero_grad(set_to_none=True)
-                losses["loss"].backward()
-                grad_clip = float(cfg["train"].get("grad_clip_norm", 1.0))
-                if grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                optimizer.step()
-                if ema is not None:
-                    ema.update(model.module if hasattr(model, "module") else model)
-                if scheduler is not None:
-                    scheduler.step()
+        logical_batch_size = _batch_size(batch)
+        configured_microbatch = int(cfg["train"].get("microbatch_size", 0) or 0)
+        microbatch_size = min(logical_batch_size, configured_microbatch or logical_batch_size)
+        ranges = [
+            (start, min(logical_batch_size, start + microbatch_size))
+            for start in range(0, logical_batch_size, microbatch_size)
+        ]
+        if train:
+            optimizer.zero_grad(set_to_none=True)
+        losses: dict[str, torch.Tensor] = {}
+        for microbatch_index, (start, end) in enumerate(ranges):
+            microbatch = _slice_batch(batch, start, end, logical_batch_size)
+            weight = float(end - start) / float(logical_batch_size)
+            should_sync = microbatch_index == len(ranges) - 1
+            sync_context = (
+                model.no_sync()
+                if train and not should_sync and hasattr(model, "no_sync")
+                else nullcontext()
+            )
+            with sync_context, torch.set_grad_enabled(train):
+                with torch.autocast(
+                    device_type=device.type, dtype=amp_dtype, enabled=amp_enabled
+                ):
+                    micro_losses = _compute_batch_losses(
+                        model, microbatch, codec, cfg, device, train=train)
+                if not torch.isfinite(micro_losses["loss"]):
+                    raise FloatingPointError(
+                        f"Non-finite loss in {'train' if train else 'val'} epoch "
+                        f"step {steps}: {float(micro_losses['loss'].detach().cpu())}")
+                if train:
+                    (micro_losses["loss"] * weight).backward()
+            for key, value in micro_losses.items():
+                weighted = value.detach() * weight
+                losses[key] = losses.get(key, torch.zeros_like(weighted)) + weighted
+        if train:
+            grad_clip = float(cfg["train"].get("grad_clip_norm", 1.0))
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+            if ema is not None:
+                ema.update(model.module if hasattr(model, "module") else model)
+            if scheduler is not None:
+                scheduler.step()
         for k, v in losses.items():
             totals[k] = totals.get(k, 0.0) + float(v.detach().cpu())
         steps += 1

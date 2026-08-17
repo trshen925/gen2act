@@ -1,0 +1,54 @@
+# Localized four-H100 run of the updated 8-anchor x T=5 Wan-VAE baseline.
+# Model/action/sampling semantics come from origin/feature/wan-vae at d84ee70;
+# only cluster paths, loader geometry, logging and checkpoint cadence differ.
+_base_: droidFULL_wanvae_jointvelocity_pi05_letterbox_fulltrain.yaml
+
+experiment:
+  name: local_wanvae_t5_full_droid_4gpu_fromscratch
+  output_dir: /mnt/project/simvla/world_policy_storage/gen2act/outputs/local_wanvae_t5_full_droid_4gpu_fromscratch
+
+data:
+  root: /mnt/project/simvla/world_policy_storage/gen2act/droid-decompressed-1.0.1
+  filter_manifest: /mnt/project/simvla/world_policy_storage/gen2act/artifacts/raw_droid_1_0_1_pi05_manifest.json
+  max_episodes: null
+  max_windows: null
+  frames_subdir: frames
+  frames_ext: jpg
+  video_reader_cache: 4
+  intrinsics_json: null
+  wrist_current:
+    raw_root: /mnt/project/simvla/world_policy_storage/gen2act/droid-decompressed-1.0.1
+  depth:
+    root: null
+  native_action_sampling:
+    cache_path: /mnt/project/simvla/world_policy_storage/gen2act/artifacts/c40_raw_droid_jointvelocity_window_index.json
+
+model:
+  backbone:
+    # Keep the tested official backend/checkpoint mandatory on this cluster.
+    fallback_backends: []
+
+train:
+  # Preserve the established global batch: 4 H100s x 24 = 96.
+  batch_size: 24
+  # T=5 peaks above 80 GiB at a physical batch of 24. Split each logical batch
+  # into two DDP-aware forwards while retaining one optimizer/scheduler step.
+  microbatch_size: 12
+  num_workers: 8
+  persistent_workers: false
+  prefetch_factor: 2
+  resume_checkpoint: null
+  resume_full_checkpoint: null
+  checkpoint:
+    every_steps: 5000
+    keep_last_step_checkpoints: 2
+  logging:
+    log_every: 100
+    wandb:
+      enabled: true
+      mode: online
+      project: gen2act
+      entity: trshen925-peking-university
+      group: wanvae_t5_raw_droid_local
+      name: local_wanvae_t5_full_droid_4gpu_fromscratch
+      credential: /mnt/home/sujiayi/.credentials/wandb_api.txt
