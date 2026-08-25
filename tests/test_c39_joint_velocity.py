@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -74,6 +75,59 @@ class C39JointVelocityTest(unittest.TestCase):
         frames = dataset._read_front_with_translation(episode, [0, 100, 2000], 0.0, 0.0)
 
         self.assertEqual(tuple(frames.shape), (3, 3, 8, 8))
+
+    def test_video_reader_evicts_before_opening_at_cache_limit(self) -> None:
+        class FakeReader:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        dataset = object.__new__(WindowedRobotDataset)
+        first = FakeReader()
+        second = FakeReader()
+        replacement = FakeReader()
+        dataset._video_cache = {Path("first.mp4"): first, Path("second.mp4"): second}
+        dataset.data_cfg = {"video_reader_cache": 2, "video_reader_retries": 0}
+
+        def open_reader(*_args, **_kwargs):
+            self.assertTrue(first.closed)
+            return replacement
+
+        with patch("r2r_gen2act.data.adapters.base.imageio.get_reader", side_effect=open_reader):
+            reader = dataset._reader(Path("third.mp4"))
+
+        self.assertIs(reader, replacement)
+        self.assertNotIn(Path("first.mp4"), dataset._video_cache)
+
+    def test_video_reader_retries_after_releasing_cached_processes(self) -> None:
+        class FakeReader:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        dataset = object.__new__(WindowedRobotDataset)
+        stale = FakeReader()
+        recovered = FakeReader()
+        dataset._video_cache = {Path("stale.mp4"): stale}
+        dataset.data_cfg = {
+            "video_reader_cache": 2,
+            "video_reader_retries": 1,
+            "video_reader_retry_delay": 0,
+        }
+
+        with patch(
+            "r2r_gen2act.data.adapters.base.imageio.get_reader",
+            side_effect=[OSError("temporary ffmpeg failure"), recovered],
+        ) as get_reader:
+            reader = dataset._reader(Path("target.mp4"))
+
+        self.assertIs(reader, recovered)
+        self.assertTrue(stale.closed)
+        self.assertEqual(get_reader.call_count, 2)
 
     def test_mapped_clip_offsets_front_indices_and_keeps_logical_length(self) -> None:
         dataset = self._source_crop_dataset("val")

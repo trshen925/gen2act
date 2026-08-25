@@ -16,7 +16,7 @@ WANDB_VENDOR_DIR="${WANDB_VENDOR_DIR:-/mnt/pfs/users/shentingrui/.cache/gen2act/
 LOG_DIR="${LOG_DIR:-outputs/droidFULL_C40_jointvelocity_pi05_letterbox_fulltrain/logs}"
 LOG_FILE="${LOG_FILE:-$LOG_DIR/train_$(date -u +%Y%m%d_%H%M%S).log}"
 
-if [[ ! -f "$MANIFEST" ]]; then
+if [[ "$MANIFEST" != "/dev/null" && ! -f "$MANIFEST" ]]; then
     echo "filter manifest not found: $ROOT/$MANIFEST" >&2
     echo "build it first with: bash scripts/build_raw_droid_pi05_manifest.sh" >&2
     exit 1

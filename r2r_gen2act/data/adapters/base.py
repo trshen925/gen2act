@@ -447,19 +447,50 @@ class WindowedRobotDataset(Dataset):
             # pthread_create per reader, and with many DataLoader workers x ranks that hits the
             # container's process/thread limit (EAGAIN -> "Could not load meta information").
             threads = str(max(1, int(self.data_cfg.get("ffmpeg_threads", 1))))
-            reader = imageio.get_reader(str(path), format="ffmpeg", input_params=["-threads", threads], output_params=["-threads", threads])
             # Bound the cache: each cached reader is a live ffmpeg subprocess. Without a cap a
             # worker leaks one process per distinct video it visits and exhausts the pid limit.
             max_cache = int(self.data_cfg.get("video_reader_cache", 8))
             if max_cache > 0 and len(self._video_cache) >= max_cache:
                 old_path = next(iter(self._video_cache))
-                old_reader = self._video_cache.pop(old_path)
+                self._close_reader(old_path)
+            retries = max(0, int(self.data_cfg.get("video_reader_retries", 3)))
+            retry_delay = max(0.0, float(self.data_cfg.get("video_reader_retry_delay", 0.25)))
+            last_error: Exception | None = None
+            for attempt in range(retries + 1):
                 try:
-                    old_reader.close()
-                except Exception:
-                    pass
+                    reader = imageio.get_reader(
+                        str(path),
+                        format="ffmpeg",
+                        input_params=["-threads", threads],
+                        output_params=["-threads", threads],
+                    )
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    # A failed ffmpeg spawn is commonly transient resource pressure. Release the
+                    # other live subprocesses in this worker before trying again.
+                    self._close_video_cache()
+                    if attempt < retries and retry_delay > 0:
+                        time.sleep(retry_delay * (2 ** attempt))
+            else:
+                raise OSError(
+                    f"Could not open video after {retries + 1} attempts: {path}"
+                ) from last_error
             self._video_cache[path] = reader
         return reader
+
+    def _close_reader(self, path: Path) -> None:
+        reader = self._video_cache.pop(path, None)
+        if reader is None:
+            return
+        try:
+            reader.close()
+        except Exception:
+            pass
+
+    def _close_video_cache(self) -> None:
+        for path in list(self._video_cache):
+            self._close_reader(path)
 
     def _video_length(self, reader) -> int:
         try:
@@ -543,6 +574,8 @@ class WindowedRobotDataset(Dataset):
                 try:
                     frames = np.stack([reader.get_data(i) for i in range(start, end)], axis=0)
                 except Exception:
+                    # Do not return a reader whose ffmpeg subprocess may have died to the cache.
+                    self._close_reader(path)
                     return None
                 size = int(frames.nbytes)
                 if size > budget:

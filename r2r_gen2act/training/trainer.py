@@ -284,6 +284,25 @@ def _build_scheduler(optimizer, cfg: dict, steps_per_epoch: int):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def _override_optimizer_learning_rate(optimizer, learning_rate: float) -> list[float]:
+    """Set a new peak LR while preserving per-group backbone/LLRD ratios."""
+    if learning_rate <= 0.0:
+        raise ValueError("train.resume_learning_rate must be positive")
+    reference_lr = max(
+        float(group.get("initial_lr", group["lr"])) for group in optimizer.param_groups
+    )
+    if reference_lr <= 0.0:
+        raise ValueError("Cannot rescale optimizer parameter groups from a non-positive LR")
+    learning_rates = []
+    for group in optimizer.param_groups:
+        group_reference_lr = float(group.get("initial_lr", group["lr"]))
+        group_lr = learning_rate * group_reference_lr / reference_lr
+        group["lr"] = group_lr
+        group["initial_lr"] = group_lr
+        learning_rates.append(group_lr)
+    return learning_rates
+
+
 def run_epoch(
     model, loader, codec, cfg, device, optimizer=None, train: bool = True,
     scheduler=None, world_size: int = 1, ema: ModelEMA | None = None,
@@ -550,7 +569,19 @@ def train(cfg: dict, device: str | None = None) -> Path:
                         v = row2.get("val_loss", "")
                         if v not in ("", None):
                             best = min(best, float(v))
-        if scheduler is not None and ckpt.get("scheduler_state_dict") is not None:
+        resume_learning_rate = cfg["train"].get("resume_learning_rate")
+        if resume_learning_rate is not None:
+            resumed_lrs = _override_optimizer_learning_rate(
+                optimizer, float(resume_learning_rate))
+            if scheduler is not None:
+                scheduler.base_lrs = list(resumed_lrs)
+            if is_main:
+                print(
+                    f"[resume_lr] peak={max(resumed_lrs):.8g} "
+                    f"min={min(resumed_lrs):.8g} groups={len(resumed_lrs)}; "
+                    f"scheduler={cfg['train'].get('scheduler', {}).get('name', 'none')}"
+                )
+        elif scheduler is not None and ckpt.get("scheduler_state_dict") is not None:
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         elif scheduler is not None:
             # Backward compatibility with epoch-only checkpoints created before

@@ -49,11 +49,18 @@ class RobolabSimDataset(DroidExOutDataset):
         if max_episodes not in (None, ""):
             dirs = dirs[: int(max_episodes)]
         ids = [d.name for d in dirs]
-        val_count = self.data_cfg.get("val_count")
-        val_count = None if val_count in (None, "") else int(val_count)
-        _, val_ids = split_episode_ids(
-            ids, float(self.data_cfg.get("val_ratio", 0.2)),
-            int(self.data_cfg.get("split_seed", 42)), val_count)
+        explicit_suffixes = self.data_cfg.get("explicit_val_suffixes", []) or []
+        if isinstance(explicit_suffixes, str):
+            explicit_suffixes = [explicit_suffixes]
+        if explicit_suffixes:
+            suffixes = tuple(str(value) for value in explicit_suffixes)
+            val_ids = {episode_id for episode_id in ids if episode_id.endswith(suffixes)}
+        else:
+            val_count = self.data_cfg.get("val_count")
+            val_count = None if val_count in (None, "") else int(val_count)
+            _, val_ids = split_episode_ids(
+                ids, float(self.data_cfg.get("val_ratio", 0.2)),
+                int(self.data_cfg.get("split_seed", 42)), val_count)
 
         episodes: list[EpisodeRecord] = []
         for d in dirs:

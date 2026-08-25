@@ -1,6 +1,6 @@
-# C42: C40 step-12k continuation on C39's exact filtered clip/window set, read
-# directly from full raw DROID. This is a dataset ablation against C40 and does
-# not inherit any C41 gripper-event settings.
+# C42: C39-initialized continuation on C39's exact filtered clip/window set,
+# read directly from full raw DROID. This keeps C39's clip-level validation
+# split exactly, including raw episodes shared by train and validation clips.
 _base_: droidFULL_C40_step12k_short4ep.yaml
 
 experiment:
@@ -15,11 +15,13 @@ data:
   use_mapped_train_samples: true
   # Use C40's letterbox preprocessing for the raw full-resolution front video.
   front_letterbox: true
-  video_reader_cache: 8
-  # C39 split by clip ID, which leaked overlapping clips from the same raw
-  # episode into validation. Keep its training set exact but exclude those val
-  # clips so C42 metrics are episode-disjoint.
-  exclude_mapped_val_raw_overlap: true
+  # Each worker only needs the current episode's front and wrist streams. Keep
+  # ffmpeg concurrency low on PFS and retry transient reader-spawn failures.
+  video_reader_cache: 2
+  video_reader_retries: 4
+  video_reader_retry_delay: 0.5
+  # Match C39's original 500-clip validation set exactly.
+  exclude_mapped_val_raw_overlap: false
   # The mapping preserves C39's original event-balanced 565,946-window index;
   # do not add a second window jitter or C40 uniform resampling layer.
   window_jitter: {enabled: false, max_offset: 0}
@@ -40,6 +42,25 @@ model:
   source_len: *c42_source_frames
 
 train:
+  # Continue from C42 epoch 4 with optimizer, scheduler, EMA, and global step.
+  resume_checkpoint: null
+  resume_full_checkpoint: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidFULL_C42_c39_subset_step12k_short4ep/latest.pt
+  # Preserve optimizer moments and per-layer ratios, but raise the peak/head LR
+  # after full resume and keep it fixed for the remaining training.
+  resume_learning_rate: 5.0e-6
+  optimizer:
+    lr: 5.0e-6
+  scheduler:
+    name: none
+  epochs: 18
+  # Two workers x two readers x four ranks caps live ffmpeg processes near 16.
+  num_workers: 2
+  persistent_workers: true
+  prefetch_factor: 1
+  checkpoint:
+    # Preserve progress within the long raw-video epoch if PFS or ffmpeg fails.
+    every_steps: 1000
+    keep_last_step_checkpoints: 2
   logging:
     wandb:
       group: c42_c39_subset_short_schedule

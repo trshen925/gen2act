@@ -1,0 +1,76 @@
+# C43: C39 native joint-velocity fine-tuning on RoboLab small rollouts.
+# This is an isolated experiment; existing C39/C40/RoboLab configs are unchanged.
+_base_: droidexFULL_C39_jointvelocity_pi05_fulltrain.yaml
+
+experiment:
+  name: robolab_C43_c39_finetune
+  output_dir: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/robolab_C43_c39_finetune
+
+data:
+  dataset_type: robolab_c39
+  root: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/data/robolab_dataset_small
+  episode_glob: "*"
+  source_video_name: rgb.mp4
+  # The small export contains MP4s but no pre-decoded front-frame directory.
+  frames_subdir: ""
+  wrist_video_name: wrist.mp4
+  wrist_current:
+    enabled: true
+    allow_video_fallback: true
+    letterbox: true
+  # RoboLab clips are short; unlike C39, do not require a 10-second crop.
+  source_time_crop:
+    enabled: true
+    min_seconds: 2.0
+    max_seconds: 20.0
+  front_translation:
+    enabled: false
+  augmentation:
+    enabled: true
+    p: 1.0
+    brightness: 0.20
+    contrast: 0.30
+    saturation: 0.30
+  val_ratio: 0.2
+  # Every *_env_000 rollout is validation-only; no random split overlap.
+  explicit_val_suffixes: ["_env_000"]
+  split_seed: 42
+  native_action_sampling:
+    enabled: true
+    cache_path: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/artifacts/robolab_C43_jointvelocity_window_index.json
+    velocity_idle_threshold: 0.001
+    max_idle_run: 7
+    event_before: 8
+    event_after: 16
+    normal_ratio: 0.60
+    close_ratio: 0.22
+    release_ratio: 0.18
+    seed: 42
+  proprioception:
+    # RoboLab-specific q01/q99, computed over all 119 parquet clips.
+    normalization:
+      enabled: true
+      clip: true
+      q01: [-0.510030, -0.594839, -0.352177, -2.850903, -0.358439, 1.568424, -1.591309, 0.0]
+      q99: [ 0.455252,  1.143306,  0.341134, -0.600420,  1.485815, 3.315514,  1.566043, 1.0]
+
+action:
+  # RoboLab-specific joint-velocity q01/q99; preserves C39's 8D head shape.
+  bounds_low:  [-0.204810, -0.408447, -0.174211, -0.307675, -0.310277, -0.316173, -0.574911]
+  bounds_high: [ 0.202891,  0.380136,  0.160458,  0.300808,  0.296581,  0.329470,  0.456749]
+
+train:
+  # C39 EMA/model-only checkpoint; all C39-compatible weights transfer.
+  resume_checkpoint: /mnt/pfs/users/shentingrui/code/robo/video_gen/gen2act/gen2act/outputs/droidexFULL_C39_jointvelocity_pi05_fulltrain/latest_model.pt
+  resume_full_checkpoint: null
+  resume_exclude_prefixes: []
+  epochs: 20
+  batch_size: 8
+  num_workers: 2
+  persistent_workers: true
+  prefetch_factor: 1
+  optimizer:
+    lr: 1.0e-5
+  ema:
+    enabled: true
+    decay: 0.99

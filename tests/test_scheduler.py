@@ -3,7 +3,10 @@ from __future__ import annotations
 import pytest
 import torch
 
-from r2r_gen2act.training.trainer import _build_scheduler
+from r2r_gen2act.training.trainer import (
+    _build_scheduler,
+    _override_optimizer_learning_rate,
+)
 
 
 def test_piecewise_linear_scheduler_hits_epoch_lr_targets() -> None:
@@ -54,3 +57,18 @@ def test_piecewise_linear_scheduler_rejects_invalid_points(points: list[list[flo
 
     with pytest.raises(ValueError):
         _build_scheduler(optimizer, cfg, steps_per_epoch=10)
+
+
+def test_resume_learning_rate_override_preserves_parameter_group_ratios() -> None:
+    parameters = [torch.nn.Parameter(torch.zeros(())) for _ in range(3)]
+    optimizer = torch.optim.AdamW([
+        {"params": [parameters[0]], "lr": 1.0e-6, "initial_lr": 1.0e-5},
+        {"params": [parameters[1]], "lr": 3.0e-7, "initial_lr": 3.0e-6},
+        {"params": [parameters[2]], "lr": 1.0e-7, "initial_lr": 1.0e-6},
+    ])
+
+    learning_rates = _override_optimizer_learning_rate(optimizer, 5.0e-6)
+
+    assert learning_rates == pytest.approx([5.0e-6, 1.5e-6, 5.0e-7])
+    assert [group["lr"] for group in optimizer.param_groups] == pytest.approx(learning_rates)
+    assert [group["initial_lr"] for group in optimizer.param_groups] == pytest.approx(learning_rates)

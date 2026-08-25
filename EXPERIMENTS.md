@@ -1443,3 +1443,12 @@ XYZ MAE **1.855→1.672 cm（-9.9%）**，dx/dy corr 微升。ODE 积分更细 +
 - **归一化审计**: 随机抽2000条保留episode（约54.1万Pi-kept帧），每个joint约1.86%--2.12%的速度落在q01/q99外；任一joint发生clip的帧占9.58%。训练前尚未修改该行为，后续应记录target saturation rate并视结果决定是否采用“不clip、允许归一化target超出`[-1,1]`”的Pi0.5式处理。
 - **当前状态（2026-07-28）**: 4卡任务完成pyarrow安装、manifest/index加载、C39权重加载、模型构建和NCCL初始化，日志确认`train_episodes=78224, train_windows=2000000, val_windows=13460`；但没有任何`epoch=...`记录，也没有loss history或checkpoint。因此C40只能记为**训练数据与启动链路验证完成，正式训练结果为空**，不能记为训练中或已完成。
 - **产物**: `artifacts/raw_droid_1_0_1_pi05_manifest.json`、`artifacts/c40_raw_droid_jointvelocity_window_index.json`；启动日志`outputs/droidFULL_C40_jointvelocity_pi05_letterbox_fulltrain/logs/train_20260728_134027.log`。
+
+## Exp C43 — RoboLab small 上的 C39 joint-velocity 微调  🧪 配置与数据链路验证完成，尚未训练
+
+- **目的**: 使用 RoboLab small 的原生 7D joint position / joint velocity 数据，在 C39 的视觉与 flow-DiT 权重上做小数据域适配。
+- **配置**: `configs/robolab_C43_c39_finetune.yaml`；数据类型为新增的 `robolab_c39`，不会改变旧的 `robolab_sim` 或 DROID 实验。
+- **数据**: 119 条成功 rollout，固定 15 FPS；所有 ID 以 `_env_000` 结尾的 case 固定为验证集，其余为训练集，避免同任务不同环境编号的随机泄漏。当前 smoke 统计 train=4245、val=987 个窗口（修改显式划分后以实际统计为准）。
+- **输入/输出**: RGB source 8 帧 + 当前 RGB/wrist，各 224x224；8D proprio（7D joint position + gripper）；15 步 native joint velocity + gripper action chunk。
+- **初始化**: 加载 C39 `latest_model.pt` 全部兼容权重，fresh optimizer；使用 RoboLab 自己的 joint state/action q01/q99 归一化统计。
+- **当前状态**: 配置校验、dataset 构建和单样本读取已通过；尚未启动训练或产生 checkpoint。

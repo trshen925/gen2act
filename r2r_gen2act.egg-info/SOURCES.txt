@@ -32,6 +32,7 @@ r2r_gen2act/data/adapters/openx_toto.py
 r2r_gen2act/data/adapters/pointworld_droid.py
 r2r_gen2act/data/adapters/raw_droid.py
 r2r_gen2act/data/adapters/robolab_sim.py
+r2r_gen2act/data/adapters/robolab_c39.py
 r2r_gen2act/inference/__init__.py
 r2r_gen2act/inference/predictor.py
 r2r_gen2act/modeling/__init__.py
